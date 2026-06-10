@@ -1,0 +1,12 @@
+# This repo contains only the tool's source. Runtime state lives elsewhere
+# (%LOCALAPPDATA%\onedrive-sync and the staged app copy), never here.
+
+# OS / editor noise
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp
+
+# Local test/dev artifacts (should not normally appear in this folder)
+*.log
+rclone.exe
