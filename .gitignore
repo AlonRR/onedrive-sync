@@ -10,3 +10,15 @@ desktop.ini
 # Local test/dev artifacts (should not normally appear in this folder)
 *.log
 rclone.exe
+
+# Defensive: this repo is the tool's SOURCE and must never contain secrets.
+# (Managed project folders may hold these and sync via the allow-list — but not here.)
+.env
+.env.*
+*.env
+*.local
+*.pem
+*.key
+*.pfx
+*.p12
+sync-config.local.ps1
