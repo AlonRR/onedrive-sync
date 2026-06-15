@@ -46,7 +46,8 @@ $script:LastRunEndTs   = $null   # ISO timestamp of last run-end event seen; '' 
 $script:SyncStartedAt  = $null   # [datetime] when a manual sync was started; $null = idle
 $script:IconIsOwned    = $false  # $true when current tray icon was drawn by New-StatusIcon (has owned HICON)
 $script:LastIconColor  = $null   # last color passed to New-StatusIcon; skip GDI alloc on no-change
-$script:StartedAt      = [datetime]::Now  # startup time for stale-grace-period on fresh install
+$script:StartedAt             = [datetime]::Now  # startup time for stale-grace-period on fresh install
+$script:WindowRefreshCallback = $null            # scriptblock set by open management window; cleared on close
 function Get-Cfg { if (-not $script:Cfg) { $script:Cfg = Import-OdsConfig }; return $script:Cfg }
 
 function Test-OdsSyncRunning {
@@ -390,8 +391,23 @@ function Show-OdsWindow {
 
     function Refresh-Data {
         param([switch]$Force)
+        if ($Force) {
+            # Async path: null cache, restart background scan, show placeholder, return immediately.
+            $script:CachedRows = $null
+            if ($null -ne $script:RefreshHandle) {
+                try { $script:RefreshHandle.PS.Dispose() } catch {}
+                try { $script:RefreshHandle.RS.Dispose() } catch {}
+                $script:RefreshHandle = $null
+            }
+            Start-StatusRefresh
+            $timer.Interval  = 2000   # poll quickly until the scan completes
+            $lblCounts.Text  = 'Refreshing...'
+            $grid.ItemsSource = @()
+            return
+        }
+        # Non-force path (includes initial open): use cache if warm, else scan once synchronously.
         $lastSyncs = Get-LastSyncPerProject
-        $base = if (-not $Force -and $null -ne $script:CachedRows) {
+        $base = if ($null -ne $script:CachedRows) {
             $script:CachedRows
         } else {
             $live = [object[]]@(@(Get-OdsProjectStatus -Config (Get-Cfg)) | ForEach-Object {
@@ -479,6 +495,10 @@ function Show-OdsWindow {
     $btnRetired.Add_Click({ Show-OdsRetired; Refresh-Data -Force })
     $btnRefresh.Add_Click({ Refresh-Data -Force })
     $btnSettings.Add_Click({ Show-OdsSettings; $script:Cfg = $null; Refresh-Data -Force })
+
+    # Register callback so the timer tick can push completed background scans into the grid.
+    $script:WindowRefreshCallback = { Refresh-Data }
+    $win.Add_Closed({ $script:WindowRefreshCallback = $null })
 
     Refresh-Data
     [void]$win.ShowDialog()
@@ -862,6 +882,8 @@ $timer.Add_Tick({
                     }
                 })
                 Update-TrayIcon
+                if ($timer.Interval -lt 15000) { $timer.Interval = 15000 }  # restore after a force-refresh
+                if ($null -ne $script:WindowRefreshCallback) { & $script:WindowRefreshCallback }
             } catch { } finally {
                 try { $script:RefreshHandle.PS.Dispose() } catch {}
                 try { $script:RefreshHandle.RS.Dispose() } catch {}
