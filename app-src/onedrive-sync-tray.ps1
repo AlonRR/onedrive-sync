@@ -1004,7 +1004,9 @@ $timer.Add_Tick({
         if ($null -ne $script:RefreshHandle -and $script:RefreshHandle.Async.IsCompleted) {
             try {
                 $results = $script:RefreshHandle.PS.EndInvoke($script:RefreshHandle.Async)
+                $cmpState = (Get-OdsMachineState).compare
                 $script:CachedRows = [object[]]@($results | ForEach-Object {
+                    $cmpMode = if ($null -ne $cmpState.PSObject.Properties[$_.Id]) { $cmpState.$($_.Id) } else { 'default' }
                     [PSCustomObject]@{
                         Id           = $_.Id
                         Status       = $_.Status
@@ -1012,6 +1014,7 @@ $timer.Add_Tick({
                         Git          = if ($_.Git) { 'git' } else { 'plain' }
                         LocalPresent = if ($_.LocalPresent) { 'yes' } else { '-' }
                         Conflicts    = $_.Conflicts
+                        Compare      = $cmpMode
                         Dot          = Get-StatusBrush $_.Status $_.Conflicts
                     }
                 })
