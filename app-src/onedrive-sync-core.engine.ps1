@@ -1,4 +1,4 @@
-# OneDrive sync core — engine (dot-sourced by onedrive-sync-core.ps1).
+﻿# OneDrive sync core — engine (dot-sourced by onedrive-sync-core.ps1).
 # Filters, gate, seed, bisync, verify, conflicts, divergence, versioning,
 # reconcile, restore, and the run orchestrator.
 
@@ -215,7 +215,7 @@ function Invoke-OdsBisync {
     $backup = Join-Path (Join-Path $script:OdsVersionsDir $idHash) $stamp
 
     $compareState = (Get-OdsMachineState).compare
-    $mode = if ($compareState.PSObject.Properties.Name -contains $Project.id) { $compareState.$($Project.id) } else { $Config.CompareMode }
+    $mode = if ($null -ne $compareState.PSObject.Properties[$Project.id]) { $compareState.$($Project.id) } else { $Config.CompareMode }
     $compare = if ($mode -eq 'checksum') { 'size,checksum' } else { 'size,modtime' }
 
     if (-not (Test-Path -LiteralPath $Project.local)) { New-Item -ItemType Directory -Path $Project.local -Force | Out-Null }

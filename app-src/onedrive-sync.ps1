@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     OneDrive 2-way sync — CLI front-end (launcher over onedrive-sync-core.ps1).
 
@@ -87,7 +87,7 @@ function Invoke-OdsConsolePicker {
     }
     $ans = Read-Host "Enter numbers to PULL (comma-separated), 'a' for all, Enter to skip all"
     $chosen = @()
-    if ($ans -eq 'a') { $chosen = $Undecided.id }
+    if ($ans -eq 'a') { $chosen = @($Undecided | ForEach-Object { $_.id }) }
     elseif ($ans) {
         foreach ($n in ($ans -split '[,\s]+' | Where-Object { $_ -match '^\d+$' })) {
             $idx = [int]$n - 1

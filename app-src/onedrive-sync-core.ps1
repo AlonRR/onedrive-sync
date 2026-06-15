@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     OneDrive 2-way sync — shared core module.
 
@@ -193,7 +193,10 @@ function Write-OdsJson {
     $dir = Split-Path -Parent $Path
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $tmp = "$Path.tmp.$PID"
-    ($Object | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $tmp -Encoding utf8
+    # Use -InputObject to avoid PS 5.1 pipeline-unwrapping empty arrays to no output.
+    $json = ConvertTo-Json -InputObject $Object -Depth 8 -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrEmpty($json)) { $json = if ($null -eq $Object) { 'null' } elseif ($Object -is [array]) { '[]' } else { '{}' } }
+    [System.IO.File]::WriteAllText($tmp, $json, [System.Text.Utf8Encoding]::new($false))
     Move-Item -LiteralPath $tmp -Destination $Path -Force
 }
 
@@ -207,8 +210,8 @@ function Get-OdsCatalog {
     $obj = Read-OdsJson -Path (Get-OdsMappingsPath) -Default ([pscustomobject]@{ entries=@(); forgotten=@() })
     # Tolerate the older bare-array shape.
     if ($obj -is [array]) { $obj = [pscustomobject]@{ entries = $obj; forgotten=@() } }
-    if (-not ($obj.PSObject.Properties.Name -contains 'entries'))   { $obj | Add-Member entries   @() -Force }
-    if (-not ($obj.PSObject.Properties.Name -contains 'forgotten')) { $obj | Add-Member forgotten @() -Force }
+    if ($null -eq $obj.PSObject.Properties['entries'])   { $obj | Add-Member entries   @() -Force }
+    if ($null -eq $obj.PSObject.Properties['forgotten']) { $obj | Add-Member forgotten @() -Force }
     return $obj
 }
 function Save-OdsCatalog {
@@ -243,8 +246,8 @@ function Merge-OdsCatalog {
 
 function Get-OdsMachineState {
     $s = Read-OdsJson -Path $script:OdsMachineState -Default ([pscustomobject]@{ active=@(); skip=@(); compare=@{}; deferred=@{} })
-    foreach ($p in 'active','skip') { if (-not ($s.PSObject.Properties.Name -contains $p)) { $s | Add-Member $p @() -Force } }
-    foreach ($p in 'compare','deferred') { if (-not ($s.PSObject.Properties.Name -contains $p)) { $s | Add-Member $p ([pscustomobject]@{}) -Force } }
+    foreach ($p in 'active','skip') { if ($null -eq $s.PSObject.Properties[$p]) { $s | Add-Member $p @() -Force } }
+    foreach ($p in 'compare','deferred') { if ($null -eq $s.PSObject.Properties[$p]) { $s | Add-Member $p ([pscustomobject]@{}) -Force } }
     return $s
 }
 function Save-OdsMachineState { param($State) Write-OdsJson -Path $script:OdsMachineState -Object $State }

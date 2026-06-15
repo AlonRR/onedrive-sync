@@ -1,4 +1,4 @@
-# OneDrive sync core — run orchestration & public mutations
+﻿# OneDrive sync core — run orchestration & public mutations
 # (dot-sourced by onedrive-sync-core.ps1).
 
 # ----------------------------------------------------------------------------
@@ -194,7 +194,7 @@ function Update-OdsDeferCount {
     param([string]$Id, [hashtable]$Config)
     $s = Get-OdsMachineState
     $n = 1
-    if ($s.deferred.PSObject.Properties.Name -contains $Id) { $n = [int]$s.deferred.$Id + 1 }
+    if ($null -ne $s.deferred.PSObject.Properties[$Id]) { $n = [int]$s.deferred.$Id + 1 }
     $s.deferred | Add-Member -NotePropertyName $Id -NotePropertyValue $n -Force
     if ($n -ge $Config.DeferEscalateCycles) {
         Write-OdsLog "ESCALATION: $Id deferred $n consecutive cycles — needs attention." 'ERROR'
@@ -324,12 +324,28 @@ function Update-OdsAppFromSource {
     $localVer = if (Test-Path -LiteralPath $localVerFile) { (Get-Content -LiteralPath $localVerFile -Raw).Trim() } else { '' }
     if ($srcVer -eq $localVer) { return 'current' }
     if ($Config.ToolUpdateMode -eq 'notify') { return 'available' }
-    # auto: stage everything except the running entry script (applied next run).
+
+    # Kill any lingering tray process so its files are not in use during the copy.
+    $trayPattern = [regex]::Escape((Join-Path $script:OdsAppDir 'onedrive-sync-tray.ps1'))
+    $trayProcs = Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match $trayPattern }
+    $hadTray = $trayProcs -as [bool]
+    if ($trayProcs) { $trayProcs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }
+    if ($hadTray) { Start-Sleep -Milliseconds 500 }
+
+    # Stage all updated files.
     if (-not (Test-Path -LiteralPath $script:OdsAppDir)) { New-Item -ItemType Directory -Path $script:OdsAppDir -Force | Out-Null }
     Get-ChildItem -LiteralPath $srcDir -File | ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $script:OdsAppDir $_.Name) -Force
     }
     Write-OdsLog "Staged tool update $localVer -> $srcVer." 'INFO'
+
+    # Restart the tray if it was running.
+    if ($hadTray) {
+        $trayScript = Join-Path $script:OdsAppDir 'onedrive-sync-tray.ps1'
+        Start-Process powershell.exe -ArgumentList @('-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$trayScript`"") -ErrorAction SilentlyContinue
+    }
+
     return 'updated'
 }
 #endregion

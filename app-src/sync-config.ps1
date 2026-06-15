@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     OneDrive 2-way sync — configuration (env-var based, synced via OneDrive).
 

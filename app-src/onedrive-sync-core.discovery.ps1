@@ -1,4 +1,4 @@
-# OneDrive sync core — discovery (dot-sourced by onedrive-sync-core.ps1).
+﻿# OneDrive sync core — discovery (dot-sourced by onedrive-sync-core.ps1).
 # Builds the available project set. A project object has:
 #   id    : OneDrive-relative path (unique key)
 #   kind  : 'mirror' | 'watch' | 'plain'
