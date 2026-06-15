@@ -257,6 +257,105 @@ function Get-LastSyncPerProject {
 }
 
 # ---------------------------------------------------------------------------
+#  Watch folder dialog
+# ---------------------------------------------------------------------------
+$WatchXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Watch Folder"
+        Width="520" Height="230"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="NoResize"
+        FontFamily="Segoe UI" FontSize="13">
+  <Grid Margin="16">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <TextBlock Grid.Row="0" Text="Sync a git folder at an explicit OneDrive location."
+               Foreground="#555555" Margin="0,0,0,14"/>
+    <Grid Grid.Row="1" Margin="0,0,0,10">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="110"/>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="Auto"/>
+      </Grid.ColumnDefinitions>
+      <TextBlock Grid.Column="0" Text="Local folder:" VerticalAlignment="Center"/>
+      <TextBox   Grid.Column="1" x:Name="txtLocal" IsReadOnly="True" Padding="5,4"
+                 Background="#F8F8F8" BorderBrush="#CCCCCC" VerticalContentAlignment="Center"/>
+      <Button    Grid.Column="2" x:Name="btnBrowseLocal" Content="Browse..." Margin="8,0,0,0"
+                 Background="#5C5C5C" Foreground="White" BorderThickness="0" Padding="10,6" Cursor="Hand"/>
+    </Grid>
+    <Grid Grid.Row="2" Margin="0,0,0,10">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="110"/>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="Auto"/>
+      </Grid.ColumnDefinitions>
+      <TextBlock Grid.Column="0" Text="OneDrive dest:" VerticalAlignment="Center"/>
+      <TextBox   Grid.Column="1" x:Name="txtDest" IsReadOnly="True" Padding="5,4"
+                 Background="#F8F8F8" BorderBrush="#CCCCCC" VerticalContentAlignment="Center"/>
+      <Button    Grid.Column="2" x:Name="btnBrowseDest" Content="Browse..." Margin="8,0,0,0"
+                 Background="#5C5C5C" Foreground="White" BorderThickness="0" Padding="10,6" Cursor="Hand"/>
+    </Grid>
+    <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
+      <Button x:Name="btnCancel"   Content="Cancel" Width="90" Margin="0,0,8,0"
+              Background="#5C5C5C" Foreground="White" BorderThickness="0" Padding="0,7" Cursor="Hand"/>
+      <Button x:Name="btnAddWatch" Content="Add"    Width="90"
+              Background="#107C10" Foreground="White" BorderThickness="0" Padding="0,7" Cursor="Hand"/>
+    </StackPanel>
+  </Grid>
+</Window>
+'@
+
+function Show-OdsWatch {
+    $cfg = Get-Cfg
+    $od  = try { Get-OdsOneDriveRoot } catch { '' }
+    $win = New-WpfWindow $WatchXaml
+
+    $txtLocal       = $win.FindName('txtLocal')
+    $txtDest        = $win.FindName('txtDest')
+    $btnBrowseLocal = $win.FindName('btnBrowseLocal')
+    $btnBrowseDest  = $win.FindName('btnBrowseDest')
+    $btnAddWatch    = $win.FindName('btnAddWatch')
+    $btnCancel      = $win.FindName('btnCancel')
+
+    $btnBrowseLocal.Add_Click({
+        $f = Select-OdsFolder -Title 'Select the LOCAL git folder to watch' -InitialDir $env:USERPROFILE
+        if ($f) { $txtLocal.Text = $f }
+    })
+    $btnBrowseDest.Add_Click({
+        $f = Select-OdsFolder -Title 'Select OneDrive destination for this folder' -InitialDir $od
+        if ($f) { $txtDest.Text = $f }
+    })
+    $btnCancel.Add_Click({ $win.Close() })
+    $btnAddWatch.Add_Click({
+        $local = $txtLocal.Text.Trim()
+        $dest  = $txtDest.Text.Trim()
+        if (-not $local -or -not $dest) {
+            [System.Windows.MessageBox]::Show('Select both a local folder and an OneDrive destination.', 'OneDrive Sync', 'OK', 'Warning') | Out-Null
+            return
+        }
+        if (-not (Test-Path -LiteralPath $local)) {
+            [System.Windows.MessageBox]::Show("Local folder not found:`n$local", 'OneDrive Sync', 'OK', 'Warning') | Out-Null
+            return
+        }
+        try {
+            $id = Add-OdsWatchMapping -Local $local -Dest $dest -Config $cfg
+            $win.Close()
+            Invoke-Cli @('-Pull', $id)
+        } catch {
+            [System.Windows.MessageBox]::Show($_.Exception.Message, 'OneDrive Sync', 'OK', 'Error') | Out-Null
+        }
+    })
+
+    [void]$win.ShowDialog()
+}
+
+# ---------------------------------------------------------------------------
 #  Per-project settings dialog
 # ---------------------------------------------------------------------------
 $ProjectSettingsXaml = @'
@@ -396,6 +495,7 @@ $MainXaml = @'
         <Button x:Name="btnForget"     Content="Retire"       Background="#C50F1F" Style="{StaticResource Btn}"/>
         <Rectangle Width="1" Fill="#E0E0E0" Margin="6,3"/>
         <Button x:Name="btnConflicts"  Content="Conflicts"    Background="#5C5C5C" Style="{StaticResource Btn}"/>
+        <Button x:Name="btnWatch"      Content="Watch..."     Background="#107C10" Style="{StaticResource Btn}"/>
         <Button x:Name="btnDiscover"   Content="Discover New" Background="#107C10" Style="{StaticResource Btn}"/>
         <Button x:Name="btnRetired"    Content="Show Retired" Background="#5C5C5C" Style="{StaticResource Btn}"/>
         <Button x:Name="btnRefresh"    Content="Refresh"      Background="#5C5C5C" Style="{StaticResource Btn}"/>
@@ -474,6 +574,7 @@ function Show-OdsWindow {
     $btnUnmap      = $win.FindName('btnUnmap')
     $btnForget     = $win.FindName('btnForget')
     $btnConflicts  = $win.FindName('btnConflicts')
+    $btnWatch      = $win.FindName('btnWatch')
     $btnDiscover   = $win.FindName('btnDiscover')
     $btnRetired    = $win.FindName('btnRetired')
     $btnRefresh      = $win.FindName('btnRefresh')
@@ -588,6 +689,7 @@ function Show-OdsWindow {
         }
     })
     $btnConflicts.Add_Click({ Invoke-Cli @('-Conflicts') })
+    $btnWatch.Add_Click({ Show-OdsWatch; Refresh-Data -Force })
     $btnDiscover.Add_Click({ Show-OdsPicker; Refresh-Data -Force })
     $btnRetired.Add_Click({ Show-OdsRetired; Refresh-Data -Force })
     $btnRefresh.Add_Click({ Refresh-Data -Force })
