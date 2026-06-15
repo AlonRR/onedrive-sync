@@ -48,6 +48,8 @@ $script:IconIsOwned    = $false  # $true when current tray icon was drawn by New
 $script:LastIconColor  = $null   # last color passed to New-StatusIcon; skip GDI alloc on no-change
 $script:StartedAt             = [datetime]::Now  # startup time for stale-grace-period on fresh install
 $script:WindowRefreshCallback = $null            # scriptblock set by open management window; cleared on close
+$script:MainWin               = $null            # singleton management window (hidden when minimized to tray)
+$script:WinForceClose         = $false           # $true when Exit intentionally closes the window
 function Get-Cfg { if (-not $script:Cfg) { $script:Cfg = Import-OdsConfig }; return $script:Cfg }
 
 function Test-OdsSyncRunning {
@@ -255,6 +257,87 @@ function Get-LastSyncPerProject {
 }
 
 # ---------------------------------------------------------------------------
+#  Per-project settings dialog
+# ---------------------------------------------------------------------------
+$ProjectSettingsXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Project Settings"
+        Width="400" Height="230"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="NoResize"
+        FontFamily="Segoe UI" FontSize="13">
+  <Grid Margin="16">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="130"/>
+      <ColumnDefinition Width="*"/>
+    </Grid.ColumnDefinitions>
+    <TextBlock Grid.Row="0" Grid.ColumnSpan="2" x:Name="lblProject" FontWeight="SemiBold"
+               FontSize="14" Margin="0,0,0,14" Foreground="#222222"/>
+    <TextBlock Grid.Row="1" Grid.Column="0" Text="Compare mode:" VerticalAlignment="Center" Margin="0,0,0,10"/>
+    <ComboBox  Grid.Row="1" Grid.Column="1" x:Name="cmbCompare" Margin="0,0,0,10">
+      <ComboBoxItem Content="Default (from config)" Tag=""/>
+      <ComboBoxItem Content="modtime (fast)"        Tag="modtime"/>
+      <ComboBoxItem Content="checksum (thorough)"   Tag="checksum"/>
+    </ComboBox>
+    <TextBlock Grid.Row="2" Grid.Column="0" Text="Max delete %:" VerticalAlignment="Center" Margin="0,0,0,10"/>
+    <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,10">
+      <TextBox x:Name="txtMaxDelete" Width="70" VerticalContentAlignment="Center" Padding="4,3"/>
+      <TextBlock Text="  (blank = default)" VerticalAlignment="Center" Foreground="#888888" FontSize="11"/>
+    </StackPanel>
+    <StackPanel Grid.Row="4" Grid.ColumnSpan="2" Orientation="Horizontal" HorizontalAlignment="Right">
+      <Button x:Name="btnCancel" Content="Cancel" Width="90" Margin="0,0,8,0"
+              Background="#5C5C5C" Foreground="White" BorderThickness="0" Padding="0,7" Cursor="Hand"/>
+      <Button x:Name="btnSave"   Content="Save"   Width="90"
+              Background="#0078D4" Foreground="White" BorderThickness="0" Padding="0,7" Cursor="Hand"/>
+    </StackPanel>
+  </Grid>
+</Window>
+'@
+
+function Show-OdsProjectSettings {
+    param([string]$ProjectId)
+    $s   = Get-OdsMachineState
+    $win = New-WpfWindow $ProjectSettingsXaml
+
+    $lbl       = $win.FindName('lblProject')
+    $cmb       = $win.FindName('cmbCompare')
+    $txt       = $win.FindName('txtMaxDelete')
+    $btnSave   = $win.FindName('btnSave')
+    $btnCancel = $win.FindName('btnCancel')
+
+    $lbl.Text = $ProjectId
+
+    $curMode = if ($null -ne $s.compare.PSObject.Properties[$ProjectId]) { $s.compare.$ProjectId } else { '' }
+    foreach ($item in $cmb.Items) {
+        if ($item.Tag -eq $curMode) { $cmb.SelectedItem = $item; break }
+    }
+    if ($null -eq $cmb.SelectedItem) { $cmb.SelectedIndex = 0 }
+
+    if ($null -ne $s.maxDelete.PSObject.Properties[$ProjectId]) {
+        $txt.Text = [string]($s.maxDelete.$ProjectId)
+    }
+
+    $btnCancel.Add_Click({ $win.Close() })
+    $btnSave.Add_Click({
+        $mode = $cmb.SelectedItem.Tag
+        $mdTxt = $txt.Text.Trim()
+        $md = if ($mdTxt -match '^\d+$') { [int]$mdTxt } else { $null }
+        Set-OdsProjectSettings -Id $ProjectId -CompareMode $mode -MaxDelete $md
+        $win.Close()
+    })
+
+    [void]$win.ShowDialog()
+}
+
+# ---------------------------------------------------------------------------
 #  Management window
 # ---------------------------------------------------------------------------
 $MainXaml = @'
@@ -317,6 +400,7 @@ $MainXaml = @'
         <Button x:Name="btnRetired"    Content="Show Retired" Background="#5C5C5C" Style="{StaticResource Btn}"/>
         <Button x:Name="btnRefresh"    Content="Refresh"      Background="#5C5C5C" Style="{StaticResource Btn}"/>
         <Rectangle Width="1" Fill="#E0E0E0" Margin="6,3"/>
+        <Button x:Name="btnProjSettings" Content="Project..."   Background="#5C5C5C" Style="{StaticResource Btn}"/>
         <Button x:Name="btnSettings"   Content="Settings..."    Background="#5C5C5C" Style="{StaticResource Btn}"/>
       </WrapPanel>
     </Border>
@@ -356,6 +440,7 @@ $MainXaml = @'
         <DataGridTextColumn Header="GIT"       Binding="{Binding Git}"           Width="50"/>
         <DataGridTextColumn Header="LOCAL"     Binding="{Binding LocalPresent}"  Width="55"/>
         <DataGridTextColumn Header="CONFLICTS" Binding="{Binding Conflicts}"     Width="80"/>
+        <DataGridTextColumn Header="COMPARE"   Binding="{Binding Compare}"       Width="80"/>
         <DataGridTextColumn Header="LAST SYNC"  Binding="{Binding LastSync}"    Width="90"/>
       </DataGrid.Columns>
     </DataGrid>
@@ -372,8 +457,15 @@ $MainXaml = @'
 '@
 
 function Show-OdsWindow {
+    if ($null -ne $script:MainWin) {
+        $script:MainWin.Show()
+        $script:MainWin.WindowState = [System.Windows.WindowState]::Normal
+        $script:MainWin.Activate()
+        return
+    }
     $cfg = Get-Cfg
     $win = New-WpfWindow $MainXaml
+    $script:MainWin = $win
 
     $grid          = $win.FindName('grid')
     $btnSyncNow    = $win.FindName('btnSyncNow')
@@ -384,7 +476,8 @@ function Show-OdsWindow {
     $btnConflicts  = $win.FindName('btnConflicts')
     $btnDiscover   = $win.FindName('btnDiscover')
     $btnRetired    = $win.FindName('btnRetired')
-    $btnRefresh    = $win.FindName('btnRefresh')
+    $btnRefresh      = $win.FindName('btnRefresh')
+    $btnProjSettings = $win.FindName('btnProjSettings')
     $btnSettings   = $win.FindName('btnSettings')
     $lblLastSync   = $win.FindName('lblLastSync')
     $lblCounts     = $win.FindName('lblCounts')
@@ -410,7 +503,9 @@ function Show-OdsWindow {
         $base = if ($null -ne $script:CachedRows) {
             $script:CachedRows
         } else {
+            $cmpState = (Get-OdsMachineState).compare
             $live = [object[]]@(@(Get-OdsProjectStatus -Config (Get-Cfg)) | ForEach-Object {
+                $cmpMode = if ($null -ne $cmpState.PSObject.Properties[$_.Id]) { $cmpState.$($_.Id) } else { 'default' }
                 [PSCustomObject]@{
                     Id           = $_.Id
                     Status       = $_.Status
@@ -418,6 +513,7 @@ function Show-OdsWindow {
                     Git          = if ($_.Git) { 'git' } else { 'plain' }
                     LocalPresent = if ($_.LocalPresent) { 'yes' } else { '-' }
                     Conflicts    = $_.Conflicts
+                    Compare      = $cmpMode
                     Dot          = Get-StatusBrush $_.Status $_.Conflicts
                 }
             })
@@ -435,6 +531,7 @@ function Show-OdsWindow {
                 Git          = $_.Git
                 LocalPresent = $_.LocalPresent
                 Conflicts    = $_.Conflicts
+                Compare      = $_.Compare
                 LastSync     = if ($lastSyncs.ContainsKey($_.Id)) { $lastSyncs[$_.Id] } else { '-' }
             }
         })
@@ -495,10 +592,36 @@ function Show-OdsWindow {
     $btnRetired.Add_Click({ Show-OdsRetired; Refresh-Data -Force })
     $btnRefresh.Add_Click({ Refresh-Data -Force })
     $btnSettings.Add_Click({ Show-OdsSettings; $script:Cfg = $null; Refresh-Data -Force })
+    $btnProjSettings.Add_Click({
+        $ids = Get-SelectedIds
+        if ($ids.Count -ne 1) { [System.Windows.MessageBox]::Show('Select exactly one project.', 'OneDrive Sync', 'OK', 'Warning') | Out-Null; return }
+        Show-OdsProjectSettings -ProjectId $ids[0]
+        Refresh-Data
+    })
+    $grid.Add_MouseDoubleClick({
+        $ids = Get-SelectedIds
+        if ($ids.Count -eq 1) { Show-OdsProjectSettings -ProjectId $ids[0]; Refresh-Data }
+    })
 
     # Register callback so the timer tick can push completed background scans into the grid.
     $script:WindowRefreshCallback = { Refresh-Data }
-    $win.Add_Closed({ $script:WindowRefreshCallback = $null })
+    $win.Add_Closed({
+        $script:WindowRefreshCallback = $null
+        $script:MainWin       = $null
+        $script:WinForceClose = $false
+    })
+    $win.Add_Closing({
+        param($s, $e)
+        if (-not $script:WinForceClose) {
+            $e.Cancel = $true
+            $win.Hide()
+        }
+    })
+    $win.Add_StateChanged({
+        if ($win.WindowState -eq [System.Windows.WindowState]::Minimized) {
+            $win.Hide()
+        }
+    })
 
     Refresh-Data
     [void]$win.ShowDialog()
@@ -517,17 +640,20 @@ $PickerXaml = @'
   <Grid Margin="16">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
       <RowDefinition Height="*"/>
       <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
     <TextBlock Grid.Row="0" Text="Select which projects to pull to this machine:"
-               Foreground="#333333" Margin="0,0,0,10"/>
-    <Border Grid.Row="1" BorderBrush="#E0E0E0" BorderThickness="1" CornerRadius="4">
+               Foreground="#333333" Margin="0,0,0,6"/>
+    <CheckBox Grid.Row="1" x:Name="cbSelectAll" Content="Select All"
+              Margin="4,0,0,8" FontSize="13"/>
+    <Border Grid.Row="2" BorderBrush="#E0E0E0" BorderThickness="1" CornerRadius="4">
       <ScrollViewer VerticalScrollBarVisibility="Auto">
         <StackPanel x:Name="pnlItems" Margin="8"/>
       </ScrollViewer>
     </Border>
-    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+    <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
       <Button x:Name="btnSkipAll" Content="Skip All" Width="90" Margin="0,0,8,0"
               Background="#5C5C5C" Foreground="White" BorderThickness="0" Padding="0,7" Cursor="Hand"/>
       <Button x:Name="btnOk" Content="Sync Selected" Width="120"
@@ -555,6 +681,7 @@ function Show-OdsPicker {
     $pnl     = $win.FindName('pnlItems')
     $btnOk   = $win.FindName('btnOk')
     $btnSkip = $win.FindName('btnSkipAll')
+    $cbAll   = $win.FindName('cbSelectAll')
 
     foreach ($u in $undecided) {
         $cb         = New-Object System.Windows.Controls.CheckBox
@@ -564,6 +691,9 @@ function Show-OdsPicker {
         $cb.FontSize = 13
         $pnl.Children.Add($cb) | Out-Null
     }
+
+    $cbAll.Add_Checked({   foreach ($cb in $pnl.Children) { $cb.IsChecked = $true  } })
+    $cbAll.Add_Unchecked({ foreach ($cb in $pnl.Children) { $cb.IsChecked = $false } })
 
     $btnOk.Add_Click({
         if (Test-OdsSyncRunning) {
@@ -856,7 +986,11 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
 [void]$menu.Items.Add('Resume sync',            $null, { Invoke-Cli @('-Resume') })
 [void]$menu.Items.Add('Open log',               $null, { Start-Process notepad.exe (Join-Path $env:LOCALAPPDATA 'onedrive-sync\logs\sync.log') })
 [void]$menu.Items.Add('-')
-[void]$menu.Items.Add('Exit',                   $null, { $icon.Visible = $false; [System.Windows.Forms.Application]::Exit() })
+[void]$menu.Items.Add('Exit',                   $null, {
+    $icon.Visible = $false
+    if ($null -ne $script:MainWin) { $script:WinForceClose = $true; $script:MainWin.Close() }
+    [System.Windows.Forms.Application]::Exit()
+})
 $icon.ContextMenuStrip = $menu
 $icon.Add_MouseClick({ if ($_.Button -eq 'Left') { Show-OdsWindow } })
 

@@ -247,7 +247,7 @@ function Merge-OdsCatalog {
 function Get-OdsMachineState {
     $s = Read-OdsJson -Path $script:OdsMachineState -Default ([pscustomobject]@{ active=@(); skip=@(); compare=@{}; deferred=@{} })
     foreach ($p in 'active','skip') { if ($null -eq $s.PSObject.Properties[$p]) { $s | Add-Member $p @() -Force } }
-    foreach ($p in 'compare','deferred') { if ($null -eq $s.PSObject.Properties[$p]) { $s | Add-Member $p ([pscustomobject]@{}) -Force } }
+    foreach ($p in 'compare','deferred','maxDelete') { if ($null -eq $s.PSObject.Properties[$p]) { $s | Add-Member $p ([pscustomobject]@{}) -Force } }
     return $s
 }
 function Save-OdsMachineState { param($State) Write-OdsJson -Path $script:OdsMachineState -Object $State }
@@ -259,6 +259,22 @@ function Set-OdsState {
     $s.skip   = @($s.skip   | Where-Object { $_ -ne $Id })
     if ($Status -eq 'active') { $s.active = @($s.active) + $Id }
     elseif ($Status -eq 'skip') { $s.skip = @($s.skip) + $Id }
+    Save-OdsMachineState $s
+}
+
+function Set-OdsProjectSettings {
+    param([string]$Id, [string]$CompareMode, [object]$MaxDelete)
+    $s = Get-OdsMachineState
+    if ($CompareMode) {
+        $s.compare | Add-Member -NotePropertyName $Id -NotePropertyValue $CompareMode -Force
+    } else {
+        $s.compare.PSObject.Properties.Remove($Id)
+    }
+    if ($null -ne $MaxDelete) {
+        $s.maxDelete | Add-Member -NotePropertyName $Id -NotePropertyValue ([int]$MaxDelete) -Force
+    } else {
+        $s.maxDelete.PSObject.Properties.Remove($Id)
+    }
     Save-OdsMachineState $s
 }
 

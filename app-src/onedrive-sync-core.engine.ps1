@@ -214,9 +214,12 @@ function Invoke-OdsBisync {
     $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
     $backup = Join-Path (Join-Path $script:OdsVersionsDir $idHash) $stamp
 
-    $compareState = (Get-OdsMachineState).compare
+    $machState    = Get-OdsMachineState
+    $compareState = $machState.compare
     $mode = if ($null -ne $compareState.PSObject.Properties[$Project.id]) { $compareState.$($Project.id) } else { $Config.CompareMode }
     $compare = if ($mode -eq 'checksum') { 'size,checksum' } else { 'size,modtime' }
+    $mdState   = $machState.maxDelete
+    $maxDelete = if ($null -ne $mdState.PSObject.Properties[$Project.id]) { [int]$mdState.$($Project.id) } else { $Config.MaxDeletePercent }
 
     if (-not (Test-Path -LiteralPath $Project.local)) { New-Item -ItemType Directory -Path $Project.local -Force | Out-Null }
     if (-not (Test-Path -LiteralPath $Project.dest))  { New-Item -ItemType Directory -Path $Project.dest  -Force | Out-Null }
@@ -229,7 +232,7 @@ function Invoke-OdsBisync {
         '--conflict-resolve','none',
         '--conflict-suffix', ("conflict-{0}-{1}" -f $env:COMPUTERNAME, $stamp),
         '--backup-dir1', $backup,
-        '--max-delete', $Config.MaxDeletePercent,
+        '--max-delete', $maxDelete,
         '--transfers', $Config.RcloneTransfers,
         '--compare', $compare,
         '--resilient','--recover',
