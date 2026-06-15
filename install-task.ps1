@@ -32,7 +32,9 @@ $LocalRoot    = Join-Path $env:LOCALAPPDATA 'onedrive-sync'
 $AppDir       = Join-Path $LocalRoot 'app'
 $SrcDir       = Join-Path $PSScriptRoot 'app-src'
 $RclonePin    = 'v1.69.1'   # >= 1.66 for bisync --backup-dir1
-$PwshExe      = 'powershell.exe'   # guaranteed on Win11, STA-capable for the GUI
+# Prefer PS7 (pwsh) for the sync task; tray uses powershell.exe for STA/WinForms.
+$PwshExe      = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh.exe' } else { 'powershell.exe' }
+$PwshTrayExe  = 'powershell.exe'   # tray relaunches itself under WPS -STA for WinForms
 
 function Write-Step($m) { Write-Host "==> $m" -ForegroundColor Cyan }
 
@@ -128,14 +130,14 @@ function Register-OdsTasks {
 
     $a1 = New-ScheduledTaskAction -Execute $PwshExe -Argument "-NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$syncScript`""
     $tLogon  = New-ScheduledTaskTrigger -AtLogOn
-    $tRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)
+    $tRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes) -RepetitionDuration ([timespan]::MaxValue)
     $set = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -RunOnlyIfNetworkAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 60)
     $prin = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
     $task = New-ScheduledTask -Action $a1 -Trigger @($tLogon, $tRepeat) -Settings $set -Principal $prin -Description "OneDrive 2-way sync (every $IntervalMinutes min)."
     Register-ScheduledTask -TaskName $TaskName -InputObject $task -Force | Out-Null
     Write-Host "Registered '$TaskName' (logon + every $IntervalMinutes min)." -ForegroundColor Green
 
-    $a2 = New-ScheduledTaskAction -Execute $PwshExe -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$trayScript`""
+    $a2 = New-ScheduledTaskAction -Execute $PwshTrayExe -Argument "-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$trayScript`""
     $set2 = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable
     $task2 = New-ScheduledTask -Action $a2 -Trigger (New-ScheduledTaskTrigger -AtLogOn) -Settings $set2 -Principal $prin -Description "OneDrive sync tray helper."
     Register-ScheduledTask -TaskName $TrayTaskName -InputObject $task2 -Force | Out-Null
@@ -151,7 +153,21 @@ Register-OdsTasks
 
 Write-Host ""
 Write-Host "Installed." -ForegroundColor Green
-Write-Host "Next steps:" -ForegroundColor Cyan
-Write-Host "  1. Set your OneDrive project parents to 'Always keep on this device'."
-Write-Host "  2. Run:  & '$PwshExe' -File `"$(Join-Path $AppDir 'onedrive-sync.ps1')`" -Discover"
-Write-Host "  3. The tray starts at next logon (or launch it now from $AppDir)."
+Write-Host ""
+Write-Host "ACTION REQUIRED: In File Explorer, right-click each OneDrive project parent folder" -ForegroundColor Yellow
+Write-Host "  and choose 'Always keep on this device' so the files are locally present for sync." -ForegroundColor Yellow
+Write-Host ""
+$ans = Read-Host "Have you done that (or want to skip for now)? [Y/n]"
+if ($ans -ne 'n' -and $ans -ne 'N') {
+    Write-Host ""
+    Write-Host "Running -Discover..." -ForegroundColor Cyan
+    $syncScript = Join-Path $AppDir 'onedrive-sync.ps1'
+    # -STA required for FolderBrowserDialog; always use powershell.exe here (pwsh doesn't support -STA).
+    & $PwshTrayExe -NoProfile -STA -ExecutionPolicy Bypass -File $syncScript -Discover
+}
+
+Write-Host ""
+Write-Host "Starting tray helper..." -ForegroundColor Cyan
+$trayScript = Join-Path $AppDir 'onedrive-sync-tray.ps1'
+Start-Process $PwshTrayExe -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$trayScript`"")
+Write-Host "Tray launched (check your system tray)." -ForegroundColor Green
