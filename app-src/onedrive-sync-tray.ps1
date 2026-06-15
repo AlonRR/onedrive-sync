@@ -593,13 +593,13 @@ function Show-OdsWindow {
     $btnRefresh.Add_Click({ Refresh-Data -Force })
     $btnSettings.Add_Click({ Show-OdsSettings; $script:Cfg = $null; Refresh-Data -Force })
     $btnProjSettings.Add_Click({
-        $ids = Get-SelectedIds
+        $ids = @(Get-SelectedIds)
         if ($ids.Count -ne 1) { [System.Windows.MessageBox]::Show('Select exactly one project.', 'OneDrive Sync', 'OK', 'Warning') | Out-Null; return }
         Show-OdsProjectSettings -ProjectId $ids[0]
         Refresh-Data
     })
     $grid.Add_MouseDoubleClick({
-        $ids = Get-SelectedIds
+        $ids = @(Get-SelectedIds)
         if ($ids.Count -eq 1) { Show-OdsProjectSettings -ProjectId $ids[0]; Refresh-Data }
     })
 
