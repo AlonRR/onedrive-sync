@@ -30,8 +30,7 @@ function Sync-OdsProject {
         Resolve-OdsDivergence -Project $Project
         if (-not (Test-OdsGitIntegrity -Project $Project)) {
             # don't keep a corrupt baseline -> wipe workdir listing so next run resyncs
-            $wd = Join-Path $script:OdsBisyncDir (Get-OdsIdHash $Project.id)
-            Get-ChildItem -LiteralPath $wd -Filter '*.lst' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            Reset-OdsBaseline -Id $Project.id -ListingOnly
             $status = 'error'
         }
     }
@@ -230,8 +229,7 @@ function Unmap-OdsProject {
     param([string]$Id, [hashtable]$Config, [switch]$DeleteLocal)
     $proj = @(Get-OdsProjects -Config $Config) | Where-Object { $_.id -eq $Id } | Select-Object -First 1
     Set-OdsState -Id $Id -Status skip
-    $wd = Join-Path $script:OdsBisyncDir (Get-OdsIdHash $Id)
-    if (Test-Path -LiteralPath $wd) { Remove-Item -LiteralPath $wd -Recurse -Force -ErrorAction SilentlyContinue }
+    Reset-OdsBaseline -Id $Id
     if ($DeleteLocal -and $proj -and (Test-Path -LiteralPath $proj.local)) {
         Remove-Item -LiteralPath $proj.local -Recurse -Force
         Write-OdsLog "Removed local copy of $Id (OneDrive copy preserved)." 'INFO'

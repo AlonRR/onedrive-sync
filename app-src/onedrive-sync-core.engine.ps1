@@ -47,7 +47,7 @@ function New-OdsFilterFile {
     #>
     param([object]$Project, [hashtable]$Config)
 
-    $hashDir = Join-Path $script:OdsBisyncDir (Get-OdsIdHash $Project.id)
+    $hashDir = Get-OdsWorkdir -Id $Project.id
     if (-not (Test-Path -LiteralPath $hashDir)) { New-Item -ItemType Directory -Path $hashDir -Force | Out-Null }
     $filterFile = Join-Path $hashDir 'filter.txt'
     $lines = [System.Collections.Generic.List[string]]::new()
@@ -112,6 +112,29 @@ function Get-OdsIdHash {
     $bytes = $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Id.ToLowerInvariant()))
     return ([System.BitConverter]::ToString($bytes) -replace '-','').Substring(0,16)
 }
+
+function Get-OdsWorkdir {
+    # The bisync workdir (listing + filter) for a project id, keyed by id-hash.
+    param([Parameter(Mandatory)][string]$Id)
+    Join-Path $script:OdsBisyncDir (Get-OdsIdHash $Id)
+}
+
+function Reset-OdsBaseline {
+    <#
+      Drop a project's bisync baseline so the next run does a clean --resync.
+      Default removes the whole workdir (listing + filter); -ListingOnly keeps the
+      workdir/filter but wipes only the .lst listings.
+    #>
+    param([Parameter(Mandatory)][string]$Id, [switch]$ListingOnly)
+    $wd = Get-OdsWorkdir -Id $Id
+    if (-not (Test-Path -LiteralPath $wd)) { return }
+    if ($ListingOnly) {
+        Get-ChildItem -LiteralPath $wd -Filter '*.lst' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    } else {
+        Remove-Item -LiteralPath $wd -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 #endregion
 
 # ----------------------------------------------------------------------------
@@ -198,7 +221,7 @@ function Save-OdsArchiveCopy {
 # ----------------------------------------------------------------------------
 function Test-OdsBaselineExists {
     param([object]$Project)
-    $wd = Join-Path $script:OdsBisyncDir (Get-OdsIdHash $Project.id)
+    $wd = Get-OdsWorkdir -Id $Project.id
     # bisync stores .lst listing files in the workdir once a baseline is set.
     return [bool](Get-ChildItem -LiteralPath $wd -Filter '*.lst' -ErrorAction SilentlyContinue | Select-Object -First 1)
 }

@@ -262,6 +262,27 @@ function Set-OdsState {
     Save-OdsMachineState $s
 }
 
+function Move-OdsProjectState {
+    <#
+      Re-key a project's per-machine state when its id (Dest-relative path) changes.
+      Moves active/skip membership and the deferred entry from $FromId to $ToId, and
+      clears the old id's compare/maxDelete — the caller re-writes those under $ToId
+      via Set-OdsProjectSettings. No-op when the id is unchanged.
+    #>
+    param([Parameter(Mandatory)][string]$FromId, [Parameter(Mandatory)][string]$ToId)
+    if ($FromId -eq $ToId) { return }
+    $s = Get-OdsMachineState
+    if ($s.active -contains $FromId) { $s.active = @($s.active | Where-Object { $_ -ne $FromId }) + $ToId }
+    if ($s.skip   -contains $FromId) { $s.skip   = @($s.skip   | Where-Object { $_ -ne $FromId }) + $ToId }
+    if ($null -ne $s.deferred.PSObject.Properties[$FromId]) {
+        $s.deferred | Add-Member -NotePropertyName $ToId -NotePropertyValue $s.deferred.$FromId -Force
+        $s.deferred.PSObject.Properties.Remove($FromId)
+    }
+    $s.compare.PSObject.Properties.Remove($FromId)
+    $s.maxDelete.PSObject.Properties.Remove($FromId)
+    Save-OdsMachineState $s
+}
+
 function Set-OdsProjectSettings {
     param([string]$Id, [string]$CompareMode, [object]$MaxDelete)
     $s = Get-OdsMachineState

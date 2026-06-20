@@ -90,21 +90,52 @@ function Get-StatusBrush {
     }
 }
 
-function Get-OdsLastRunEndEvent {
+# Today + yesterday's parsed JSONL events, cached and re-read only when today's
+# file changes (keyed on its mtime; yesterday's file is immutable once its day
+# passes, so it needn't be in the key). Both display helpers below derive from
+# this, so a timer tick's several Update-TrayIcon calls share one parse instead
+# of each re-reading + re-parsing the logs on the UI thread.
+$script:OdsEventCacheKey = $null
+$script:OdsEventCacheVal = @()
+function Get-OdsRecentEvents {
     try {
-        $candidates = @(
-            [datetime]::UtcNow
+        $todayFile = Join-Path $env:LOCALAPPDATA ("onedrive-sync\events\{0}.jsonl" -f [datetime]::UtcNow.ToString('yyyy-MM-dd'))
+        $key = if (Test-Path -LiteralPath $todayFile) {
+            "$todayFile|" + [System.IO.File]::GetLastWriteTimeUtc($todayFile).Ticks
+        } else { "$todayFile|none" }
+        if ($key -eq $script:OdsEventCacheKey) { return $script:OdsEventCacheVal }
+        $events = @(
             [datetime]::UtcNow.AddDays(-1)
+            [datetime]::UtcNow
         ) | ForEach-Object {
             $evf = Join-Path $env:LOCALAPPDATA ("onedrive-sync\events\{0}.jsonl" -f $_.ToString('yyyy-MM-dd'))
-            if (Test-Path $evf) {
-                Get-Content $evf -Tail 200 -ErrorAction SilentlyContinue | ForEach-Object {
-                    try { $_ | ConvertFrom-Json } catch {}
-                } | Where-Object { $_ -and $_.event -eq 'run-end' }
+            if (Test-Path -LiteralPath $evf) {
+                Get-Content -LiteralPath $evf -Tail 200 -ErrorAction SilentlyContinue | ForEach-Object {
+                    $e = $null
+                    try { $e = $_ | ConvertFrom-Json } catch {}
+                    # PS 7's ConvertFrom-Json parses ISO timestamps to [datetime]; 5.1 leaves
+                    # them as strings. Re-stamp ts to a sortable ISO-UTC string so sort/compare/
+                    # parse behave identically under whichever host runs the tray (it is 5.1
+                    # today, but a manual pwsh launch would otherwise break the date math).
+                    if ($e -and $e.PSObject.Properties['ts'] -and $e.ts -is [datetime]) {
+                        $e.ts = $e.ts.ToUniversalTime().ToString('o')
+                    }
+                    $e
+                }
             }
         }
-        return @($candidates) | Select-Object -Last 1
-    } catch { return $null }
+        $script:OdsEventCacheVal = @($events | Where-Object { $_ })
+        $script:OdsEventCacheKey = $key
+        return $script:OdsEventCacheVal
+    } catch { return @() }
+}
+
+function Get-OdsLastRunEndEvent {
+    # Most-recent run-end across today+yesterday. Sort by ts (ToString('o') is
+    # ISO-8601 UTC, so lexical = chronological); a bare -Last 1 on read order
+    # would wrongly return yesterday's run-end when both days have one.
+    @(Get-OdsRecentEvents | Where-Object { $_.event -eq 'run-end' }) |
+        Sort-Object { [string]$_.ts } | Select-Object -Last 1
 }
 
 function Get-LastSyncText {
@@ -224,23 +255,14 @@ function Start-StatusRefresh {
 #  Per-project last-sync helper  (reads today+yesterday JSONL event log)
 # ---------------------------------------------------------------------------
 function Get-LastSyncPerProject {
-    $result = @{}   # id -> ISO timestamp (keep most-recent)
-    $days   = @(
-        [datetime]::UtcNow
-        [datetime]::UtcNow.AddDays(-1)
-    )
-    foreach ($day in $days) {
-        $f = Join-Path $env:LOCALAPPDATA ("onedrive-sync\events\{0}.jsonl" -f $day.ToString('yyyy-MM-dd'))
-        if (-not (Test-Path $f)) { continue }
-        Get-Content $f -Tail 100 -ErrorAction SilentlyContinue | ForEach-Object {
-            try {
-                $ev = $_ | ConvertFrom-Json
-                if ($ev -and $ev.event -eq 'bisync' -and $ev.id) {
-                    if (-not $result.ContainsKey($ev.id) -or [string]$ev.ts -gt [string]$result[$ev.id]) {
-                        $result[$ev.id] = $ev.ts
-                    }
-                }
-            } catch {}
+    $result = @{}   # id -> most-recent ISO timestamp
+    foreach ($ev in Get-OdsRecentEvents) {
+        # .event-first short-circuit keeps StrictMode from touching .id on
+        # non-bisync events; guard .id since not every event carries it.
+        if ($ev.event -eq 'bisync' -and $ev.PSObject.Properties['id'] -and $ev.id) {
+            if (-not $result.ContainsKey($ev.id) -or [string]$ev.ts -gt [string]$result[$ev.id]) {
+                $result[$ev.id] = $ev.ts
+            }
         }
     }
     $readable = @{}
@@ -263,7 +285,7 @@ $WatchXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Watch Folder"
-        Width="520" Height="230"
+        Width="520" Height="300"
         WindowStartupLocation="CenterScreen"
         ResizeMode="NoResize"
         FontFamily="Segoe UI" FontSize="13">
@@ -272,14 +294,15 @@ $WatchXaml = @'
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
       <RowDefinition Height="*"/>
       <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
-    <TextBlock Grid.Row="0" Text="Sync a git folder at an explicit OneDrive location."
-               Foreground="#555555" Margin="0,0,0,14"/>
+    <TextBlock Grid.Row="0" Text="Choose a local folder and where it should live inside OneDrive. The folder name is preserved."
+               Foreground="#555555" TextWrapping="Wrap" Margin="0,0,0,14"/>
     <Grid Grid.Row="1" Margin="0,0,0,10">
       <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="110"/>
+        <ColumnDefinition Width="120"/>
         <ColumnDefinition Width="*"/>
         <ColumnDefinition Width="Auto"/>
       </Grid.ColumnDefinitions>
@@ -289,19 +312,21 @@ $WatchXaml = @'
       <Button    Grid.Column="2" x:Name="btnBrowseLocal" Content="Browse..." Margin="8,0,0,0"
                  Background="#5C5C5C" Foreground="White" BorderThickness="0" Padding="10,6" Cursor="Hand"/>
     </Grid>
-    <Grid Grid.Row="2" Margin="0,0,0,10">
+    <Grid Grid.Row="2" Margin="0,0,0,6">
       <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="110"/>
+        <ColumnDefinition Width="120"/>
         <ColumnDefinition Width="*"/>
         <ColumnDefinition Width="Auto"/>
       </Grid.ColumnDefinitions>
-      <TextBlock Grid.Column="0" Text="OneDrive dest:" VerticalAlignment="Center"/>
+      <TextBlock Grid.Column="0" Text="OneDrive parent:" VerticalAlignment="Center"/>
       <TextBox   Grid.Column="1" x:Name="txtDest" IsReadOnly="True" Padding="5,4"
                  Background="#F8F8F8" BorderBrush="#CCCCCC" VerticalContentAlignment="Center"/>
       <Button    Grid.Column="2" x:Name="btnBrowseDest" Content="Browse..." Margin="8,0,0,0"
                  Background="#5C5C5C" Foreground="White" BorderThickness="0" Padding="10,6" Cursor="Hand"/>
     </Grid>
-    <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
+    <TextBlock Grid.Row="3" x:Name="txtPreview" Foreground="#007ACC" FontSize="11"
+               TextWrapping="Wrap" Margin="0,2,0,0"/>
+    <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right">
       <Button x:Name="btnCancel"   Content="Cancel" Width="90" Margin="0,0,8,0"
               Background="#5C5C5C" Foreground="White" BorderThickness="0" Padding="0,7" Cursor="Hand"/>
       <Button x:Name="btnAddWatch" Content="Add"    Width="90"
@@ -318,37 +343,58 @@ function Show-OdsWatch {
 
     $txtLocal       = $win.FindName('txtLocal')
     $txtDest        = $win.FindName('txtDest')
+    $txtPreview     = $win.FindName('txtPreview')
     $btnBrowseLocal = $win.FindName('btnBrowseLocal')
     $btnBrowseDest  = $win.FindName('btnBrowseDest')
     $btnAddWatch    = $win.FindName('btnAddWatch')
     $btnCancel      = $win.FindName('btnCancel')
 
+    $blueBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#007ACC')
     $btnBrowseLocal.Add_Click({
         $f = Select-OdsFolder -Title 'Select the LOCAL git folder to watch' -InitialDir $env:USERPROFILE
-        if ($f) { $txtLocal.Text = $f }
+        if ($f) {
+            $txtLocal.Text = $f
+            if ($txtDest.Text) {
+                $leaf = Split-Path $f -Leaf
+                $txtPreview.Foreground = $blueBrush
+                $txtPreview.Text = "Will sync: $f  <->  $(Join-Path $txtDest.Text $leaf)"
+            }
+        }
     })
     $btnBrowseDest.Add_Click({
-        $f = Select-OdsFolder -Title 'Select OneDrive destination for this folder' -InitialDir $od
-        if ($f) { $txtDest.Text = $f }
+        $f = Select-OdsFolder -Title 'Select the OneDrive parent folder' -InitialDir $od
+        if ($f) {
+            $txtDest.Text = $f
+            if ($txtLocal.Text) {
+                $leaf = Split-Path $txtLocal.Text -Leaf
+                $txtPreview.Foreground = $blueBrush
+                $txtPreview.Text = "Will sync: $($txtLocal.Text)  <->  $(Join-Path $f $leaf)"
+            }
+        }
     })
     $btnCancel.Add_Click({ $win.Close() })
     $btnAddWatch.Add_Click({
-        $local = $txtLocal.Text.Trim()
-        $dest  = $txtDest.Text.Trim()
-        if (-not $local -or -not $dest) {
-            [System.Windows.MessageBox]::Show('Select both a local folder and an OneDrive destination.', 'OneDrive Sync', 'OK', 'Warning') | Out-Null
+        $local  = $txtLocal.Text.Trim()
+        $parent = $txtDest.Text.Trim()
+        if (-not $local -or -not $parent) {
+            $txtPreview.Foreground = [System.Windows.Media.Brushes]::Crimson
+            $txtPreview.Text = 'Select both a local folder and an OneDrive parent folder.'
             return
         }
         if (-not (Test-Path -LiteralPath $local)) {
-            [System.Windows.MessageBox]::Show("Local folder not found:`n$local", 'OneDrive Sync', 'OK', 'Warning') | Out-Null
+            $txtPreview.Foreground = [System.Windows.Media.Brushes]::Crimson
+            $txtPreview.Text = "Local folder not found: $local"
             return
         }
+        $leaf = Split-Path $local -Leaf
+        $dest = Join-Path $parent $leaf
         try {
             $id = Add-OdsWatchMapping -Local $local -Dest $dest -Config $cfg
             $win.Close()
             Invoke-Cli @('-Pull', $id)
         } catch {
-            [System.Windows.MessageBox]::Show($_.Exception.Message, 'OneDrive Sync', 'OK', 'Error') | Out-Null
+            $txtPreview.Foreground = [System.Windows.Media.Brushes]::Crimson
+            $txtPreview.Text = $_.Exception.Message
         }
     })
 
@@ -362,39 +408,107 @@ $ProjectSettingsXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Project Settings"
-        Width="400" Height="230"
+        Width="580" Height="500"
         WindowStartupLocation="CenterScreen"
         ResizeMode="NoResize"
         FontFamily="Segoe UI" FontSize="13">
   <Grid Margin="16">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto"/>
+      <RowDefinition Height="8"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="10"/>
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="*"/>
       <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
-    <Grid.ColumnDefinitions>
-      <ColumnDefinition Width="130"/>
-      <ColumnDefinition Width="*"/>
-    </Grid.ColumnDefinitions>
-    <TextBlock Grid.Row="0" Grid.ColumnSpan="2" x:Name="lblProject" FontWeight="SemiBold"
-               FontSize="14" Margin="0,0,0,14" Foreground="#222222"/>
-    <TextBlock Grid.Row="1" Grid.Column="0" Text="Compare mode:" VerticalAlignment="Center" Margin="0,0,0,10"/>
-    <ComboBox  Grid.Row="1" Grid.Column="1" x:Name="cmbCompare" Margin="0,0,0,10">
-      <ComboBoxItem Content="Default (from config)" Tag=""/>
-      <ComboBoxItem Content="modtime (fast)"        Tag="modtime"/>
-      <ComboBoxItem Content="checksum (thorough)"   Tag="checksum"/>
-    </ComboBox>
-    <TextBlock Grid.Row="2" Grid.Column="0" Text="Max delete %:" VerticalAlignment="Center" Margin="0,0,0,10"/>
-    <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,10">
-      <TextBox x:Name="txtMaxDelete" Width="70" VerticalContentAlignment="Center" Padding="4,3"/>
-      <TextBlock Text="  (blank = default)" VerticalAlignment="Center" Foreground="#888888" FontSize="11"/>
-    </StackPanel>
-    <StackPanel Grid.Row="4" Grid.ColumnSpan="2" Orientation="Horizontal" HorizontalAlignment="Right">
+    <!-- Row 0: Header -->
+    <DockPanel Grid.Row="0">
+      <Border x:Name="bdgKind" DockPanel.Dock="Right" CornerRadius="3" Padding="7,3"
+              Margin="10,0,0,0" VerticalAlignment="Center">
+        <TextBlock x:Name="lblKind" FontSize="11" FontWeight="SemiBold" Foreground="White"/>
+      </Border>
+      <TextBlock x:Name="lblProject" FontWeight="SemiBold" FontSize="14" Foreground="#222222"
+                 TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+    </DockPanel>
+    <!-- Row 2: PATHS label -->
+    <TextBlock Grid.Row="2" Text="PATHS" FontSize="11" FontWeight="SemiBold"
+               Foreground="#888888" Margin="0,0,0,4"/>
+    <!-- Row 3: PATHS border -->
+    <Border Grid.Row="3" BorderBrush="#E0E0E0" BorderThickness="1" CornerRadius="4" Padding="12,10">
+      <Grid>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="8"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <DockPanel Grid.Row="0">
+          <TextBlock DockPanel.Dock="Left" Text="Local folder:" Width="115" VerticalAlignment="Center"/>
+          <Button DockPanel.Dock="Right" x:Name="btnOpenLocal" Content="Open" Width="58"
+                  Margin="6,0,0,0" Background="#5C5C5C" Foreground="White"
+                  BorderThickness="0" Padding="0,6" Cursor="Hand"/>
+          <Button DockPanel.Dock="Right" x:Name="btnBrowseLocal" Content="Browse..." Width="75"
+                  Margin="6,0,0,0" Background="#5C5C5C" Foreground="White"
+                  BorderThickness="0" Padding="0,6" Cursor="Hand"/>
+          <TextBox x:Name="txtLocal" Padding="5,4" BorderBrush="#CCCCCC"
+                   VerticalContentAlignment="Center"/>
+        </DockPanel>
+        <DockPanel Grid.Row="2">
+          <TextBlock DockPanel.Dock="Left" Text="OneDrive folder:" Width="115" VerticalAlignment="Center"/>
+          <Button DockPanel.Dock="Right" x:Name="btnOpenDest" Content="Open" Width="58"
+                  Margin="6,0,0,0" Background="#5C5C5C" Foreground="White"
+                  BorderThickness="0" Padding="0,6" Cursor="Hand"/>
+          <Button DockPanel.Dock="Right" x:Name="btnBrowseDest" Content="Browse..." Width="75"
+                  Margin="6,0,0,0" Background="#5C5C5C" Foreground="White"
+                  BorderThickness="0" Padding="0,6" Cursor="Hand"/>
+          <TextBox x:Name="txtDest" Padding="5,4" BorderBrush="#CCCCCC"
+                   VerticalContentAlignment="Center"/>
+        </DockPanel>
+        <TextBlock Grid.Row="3" x:Name="lblMirrorNote" Visibility="Collapsed"
+                   Text="Mirror projects follow the OneDrive mirroring law — paths are determined by the relative folder structure and cannot be changed independently."
+                   Foreground="#888888" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,0"/>
+      </Grid>
+    </Border>
+    <!-- Row 5: SYNC SETTINGS label -->
+    <TextBlock Grid.Row="5" Text="SYNC SETTINGS" FontSize="11" FontWeight="SemiBold"
+               Foreground="#888888" Margin="0,0,0,4"/>
+    <!-- Row 6: SYNC SETTINGS border -->
+    <Border Grid.Row="6" BorderBrush="#E0E0E0" BorderThickness="1" CornerRadius="4" Padding="12,10">
+      <Grid>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="8"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="130"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock Grid.Row="0" Grid.Column="0" Text="Compare mode:" VerticalAlignment="Center"/>
+        <ComboBox  Grid.Row="0" Grid.Column="1" x:Name="cmbCompare">
+          <ComboBoxItem Content="Default (from config)" Tag=""/>
+          <ComboBoxItem Content="modtime (fast)"        Tag="modtime"/>
+          <ComboBoxItem Content="checksum (thorough)"   Tag="checksum"/>
+        </ComboBox>
+        <TextBlock Grid.Row="2" Grid.Column="0" Text="Max delete %:" VerticalAlignment="Center"/>
+        <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal">
+          <TextBox x:Name="txtMaxDelete" Width="70" VerticalContentAlignment="Center" Padding="4,3"/>
+          <TextBlock Text="  (blank = default)" VerticalAlignment="Center" Foreground="#888888" FontSize="11"/>
+        </StackPanel>
+      </Grid>
+    </Border>
+    <!-- Row 8: Status -->
+    <TextBlock Grid.Row="8" x:Name="lblStatus" Foreground="Crimson" FontSize="11"
+               TextWrapping="Wrap" Margin="0,8,0,0"/>
+    <!-- Row 9: Buttons -->
+    <StackPanel Grid.Row="9" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
       <Button x:Name="btnCancel" Content="Cancel" Width="90" Margin="0,0,8,0"
               Background="#5C5C5C" Foreground="White" BorderThickness="0" Padding="0,7" Cursor="Hand"/>
-      <Button x:Name="btnSave"   Content="Save"   Width="90"
+      <Button x:Name="btnSave" Content="Save" Width="90"
               Background="#0078D4" Foreground="White" BorderThickness="0" Padding="0,7" Cursor="Hand"/>
     </StackPanel>
   </Grid>
@@ -403,34 +517,161 @@ $ProjectSettingsXaml = @'
 
 function Show-OdsProjectSettings {
     param([string]$ProjectId)
+
+    $proj = Get-OdsProjects -Config (Get-Cfg) | Where-Object { $_.id -eq $ProjectId } | Select-Object -First 1
+    if (-not $proj) {
+        [System.Windows.MessageBox]::Show("Project '$ProjectId' not found.", 'OneDrive Sync', 'OK', 'Error') | Out-Null
+        return
+    }
+
     $s   = Get-OdsMachineState
     $win = New-WpfWindow $ProjectSettingsXaml
 
-    $lbl       = $win.FindName('lblProject')
-    $cmb       = $win.FindName('cmbCompare')
-    $txt       = $win.FindName('txtMaxDelete')
-    $btnSave   = $win.FindName('btnSave')
-    $btnCancel = $win.FindName('btnCancel')
+    $lblProject     = $win.FindName('lblProject')
+    $lblKind        = $win.FindName('lblKind')
+    $bdgKind        = $win.FindName('bdgKind')
+    $txtLocal       = $win.FindName('txtLocal')
+    $txtDest        = $win.FindName('txtDest')
+    $btnBrowseLocal = $win.FindName('btnBrowseLocal')
+    $btnBrowseDest  = $win.FindName('btnBrowseDest')
+    $btnOpenLocal   = $win.FindName('btnOpenLocal')
+    $btnOpenDest    = $win.FindName('btnOpenDest')
+    $lblMirrorNote  = $win.FindName('lblMirrorNote')
+    $cmb            = $win.FindName('cmbCompare')
+    $txtMaxDelete   = $win.FindName('txtMaxDelete')
+    $lblStatus      = $win.FindName('lblStatus')
+    $btnSave        = $win.FindName('btnSave')
+    $btnCancel      = $win.FindName('btnCancel')
 
-    $lbl.Text = $ProjectId
+    # Header
+    $lblProject.Text = $ProjectId
+    $lblKind.Text    = $proj.kind.ToUpper()
+    $conv = [System.Windows.Media.BrushConverter]::new()
+    $bdgKind.Background = switch ($proj.kind) {
+        'watch'  { $conv.ConvertFromString('#107C10') }
+        'plain'  { [System.Windows.Media.Brushes]::SteelBlue }
+        default  { [System.Windows.Media.Brushes]::DimGray }
+    }
 
+    # Paths
+    $txtLocal.Text = $proj.local
+    $txtDest.Text  = $proj.dest
+
+    if ($proj.kind -eq 'mirror') {
+        $readOnlyBg = $conv.ConvertFromString('#F8F8F8')
+        $txtLocal.IsReadOnly      = $true
+        $txtDest.IsReadOnly       = $true
+        $txtLocal.Background      = $readOnlyBg
+        $txtDest.Background       = $readOnlyBg
+        $btnBrowseLocal.IsEnabled = $false
+        $btnBrowseDest.IsEnabled  = $false
+        $lblMirrorNote.Visibility = [System.Windows.Visibility]::Visible
+    }
+
+    $openFolder = {
+        param($txt)
+        $p = $txt.Text
+        if ($p -and (Test-Path -LiteralPath $p)) { Start-Process explorer.exe $p }
+        else { $lblStatus.Text = "Folder not found: $p" }
+    }
+    $btnOpenLocal.Add_Click({ & $openFolder $txtLocal })
+    $btnOpenDest.Add_Click({  & $openFolder $txtDest  })
+
+    $od = try { Get-OdsOneDriveRoot } catch { '' }
+    $btnBrowseLocal.Add_Click({
+        $initDir = try { Split-Path $txtLocal.Text -Parent } catch { $env:USERPROFILE }
+        if (-not $initDir -or -not (Test-Path $initDir)) { $initDir = $env:USERPROFILE }
+        $f = Select-OdsFolder -Title 'Select new local folder' -InitialDir $initDir
+        if ($f) { $txtLocal.Text = $f; $lblStatus.Text = '' }
+    })
+    $btnBrowseDest.Add_Click({
+        $initDir = try { Split-Path $txtDest.Text -Parent } catch { $od }
+        if (-not $initDir -or -not (Test-Path $initDir)) { $initDir = $od }
+        $f = Select-OdsFolder -Title 'Select new OneDrive folder' -InitialDir $initDir
+        if ($f) { $txtDest.Text = $f; $lblStatus.Text = '' }
+    })
+
+    # Sync settings
     $curMode = if ($null -ne $s.compare.PSObject.Properties[$ProjectId]) { $s.compare.$ProjectId } else { '' }
     foreach ($item in $cmb.Items) {
         if ($item.Tag -eq $curMode) { $cmb.SelectedItem = $item; break }
     }
     if ($null -eq $cmb.SelectedItem) { $cmb.SelectedIndex = 0 }
-
     if ($null -ne $s.maxDelete.PSObject.Properties[$ProjectId]) {
-        $txt.Text = [string]($s.maxDelete.$ProjectId)
+        $txtMaxDelete.Text = [string]($s.maxDelete.$ProjectId)
     }
 
     $btnCancel.Add_Click({ $win.Close() })
     $btnSave.Add_Click({
-        $mode = $cmb.SelectedItem.Tag
-        $mdTxt = $txt.Text.Trim()
-        $md = if ($mdTxt -match '^\d+$') { [int]$mdTxt } else { $null }
-        Set-OdsProjectSettings -Id $ProjectId -CompareMode $mode -MaxDelete $md
-        $win.Close()
+        $lblStatus.Text = ''
+        try {
+            $mode  = $cmb.SelectedItem.Tag
+            $mdTxt = $txtMaxDelete.Text.Trim()
+            $md    = if ($mdTxt -match '^\d+$') { [int]$mdTxt } else { $null }
+
+            $newLocal = $txtLocal.Text.Trim().TrimEnd('\')
+            $newDest  = $txtDest.Text.Trim().TrimEnd('\')
+            $curLocal = $proj.local.TrimEnd('\')
+            $curDest  = $proj.dest.TrimEnd('\')
+
+            $pathsChanged = ($proj.kind -ne 'mirror') -and ($newLocal -ne $curLocal -or $newDest -ne $curDest)
+            $effectiveId  = $ProjectId
+
+            if ($pathsChanged) {
+                if (-not $newLocal) { throw 'Local folder path cannot be empty.' }
+                if (-not $newDest)  { throw 'OneDrive folder path cannot be empty.' }
+
+                if ($proj.kind -eq 'watch') {
+                    $up = $env:USERPROFILE.TrimEnd('\')
+                    $newLocalRel = Get-OdsRelUnder -Full $newLocal -Root $up
+                    $newDestRel  = Get-OdsRelUnder -Full $newDest  -Root $od
+                    if ($null -eq $newLocalRel) { throw "Local folder must be under your user profile ($up)." }
+                    if ($null -eq $newDestRel)  { throw "OneDrive folder must be under the OneDrive root ($od)." }
+
+                    $catalog = Get-OdsCatalog
+                    $entry = @($catalog.entries) | Where-Object { $_.id -eq $ProjectId } | Select-Object -First 1
+                    if (-not $entry) { throw "Catalog entry not found for '$ProjectId'." }
+                    $entry.localRel = $newLocalRel
+                    $entry.destRel  = $newDestRel
+                    $entry.id       = $newDestRel
+                    Save-OdsCatalog $catalog
+
+                    $effectiveId = $newDestRel
+                    Move-OdsProjectState -FromId $ProjectId -ToId $effectiveId
+
+                } elseif ($proj.kind -eq 'plain') {
+                    $cfg = Get-Cfg
+                    $updatedPlains = @($cfg.PlainFolders) | ForEach-Object {
+                        if ($null -ne $_ -and
+                            $_.Local.TrimEnd('\') -eq $curLocal -and
+                            $_.Dest.TrimEnd('\')  -eq $curDest) {
+                            [PSCustomObject]@{ Local = $newLocal; Dest = $newDest }
+                        } else { $_ }
+                    }
+                    Save-OdsManagedConfig -ProjectParents @($cfg.ProjectParents) -PlainFolders $updatedPlains
+
+                    # A plain project's id is its Dest relative to the OneDrive root (else full
+                    # Dest) — must match Get-OdsProjects, else a Dest change orphans its state.
+                    $newId = Get-OdsRelUnder -Full $newDest -Root $od
+                    if (-not $newId) { $newId = $newDest }
+                    $effectiveId = $newId
+                    Move-OdsProjectState -FromId $ProjectId -ToId $effectiveId
+                }
+
+                # Any path change invalidates the bisync baseline (workdir keyed by id-hash):
+                #  - id changed (Dest moved): the old workdir is now orphaned -> drop it;
+                #    the new id has no baseline and resyncs cleanly on its own.
+                #  - id unchanged (Local moved): the stale baseline would mis-compare the new
+                #    folder -> drop it to force a clean resync.
+                Reset-OdsBaseline -Id $ProjectId
+                if ($effectiveId -ne $ProjectId) { Reset-OdsBaseline -Id $effectiveId }
+            }
+
+            Set-OdsProjectSettings -Id $effectiveId -CompareMode $mode -MaxDelete $md
+            $win.Close()
+        } catch {
+            $lblStatus.Text = $_.Exception.Message
+        }
     })
 
     [void]$win.ShowDialog()
@@ -582,6 +823,7 @@ function Show-OdsWindow {
     $btnSettings   = $win.FindName('btnSettings')
     $lblLastSync   = $win.FindName('lblLastSync')
     $lblCounts     = $win.FindName('lblCounts')
+    $idleTextBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#555555')
 
     function Refresh-Data {
         param([switch]$Force)
@@ -596,7 +838,6 @@ function Show-OdsWindow {
             Start-StatusRefresh
             $timer.Interval  = 2000   # poll quickly until the scan completes
             $lblCounts.Text  = 'Refreshing...'
-            $grid.ItemsSource = @()
             return
         }
         # Non-force path (includes initial open): use cache if warm, else scan once synchronously.
@@ -636,7 +877,12 @@ function Show-OdsWindow {
                 LastSync     = if ($lastSyncs.ContainsKey($_.Id)) { $lastSyncs[$_.Id] } else { '-' }
             }
         })
+        $preSelected = @($grid.SelectedItems | ForEach-Object { $_.Id })
         $grid.ItemsSource = $src
+        foreach ($item in $grid.Items) {
+            if ($preSelected -contains $item.Id) { $grid.SelectedItems.Add($item) }
+        }
+        $lblLastSync.Foreground = $idleTextBrush
         $lblLastSync.Text = Get-LastSyncText
         $active    = @($src | Where-Object { $_.Status -eq 'active' }).Count
         $conflicts = [int](($src | Measure-Object -Property Conflicts -Sum).Sum)
@@ -648,6 +894,21 @@ function Show-OdsWindow {
     function Confirm-Action($msg) {
         [System.Windows.MessageBox]::Show($msg, 'OneDrive Sync', 'YesNo', 'Warning') -eq 'Yes'
     }
+    function Set-WinStatus {
+        param([string]$Msg, [System.Windows.Media.Brush]$Brush = $null)
+        $lblLastSync.Foreground = if ($null -eq $Brush) { $idleTextBrush } else { $Brush }
+        $lblLastSync.Text = $Msg
+    }
+    function Update-ButtonStates {
+        $n = $grid.SelectedItems.Count
+        $btnPull.IsEnabled         = $n -gt 0
+        $btnOpenFolder.IsEnabled   = $n -gt 0
+        $btnUnmap.IsEnabled        = $n -gt 0
+        $btnForget.IsEnabled       = $n -gt 0
+        $btnProjSettings.IsEnabled = $n -eq 1
+    }
+    Update-ButtonStates
+    $grid.Add_SelectionChanged({ Update-ButtonStates })
 
     $btnSyncNow.Add_Click({
         $ids = Get-SelectedIds
@@ -655,13 +916,13 @@ function Show-OdsWindow {
         else { foreach ($id in $ids) { Invoke-Cli @('-SyncNow', $id) } }
         $script:SyncStartedAt = [datetime]::Now
         Update-TrayIcon
-        [System.Windows.MessageBox]::Show('Sync started in the background.', 'OneDrive Sync', 'OK', 'Information') | Out-Null
+        Set-WinStatus 'Syncing...'
     })
     $btnPull.Add_Click({
         $ids = Get-SelectedIds
-        if (-not $ids) { [System.Windows.MessageBox]::Show('Select one or more projects first.', 'OneDrive Sync', 'OK', 'Warning') | Out-Null; return }
+        if (-not $ids) { Set-WinStatus 'Select one or more projects first.' ([System.Windows.Media.Brushes]::Crimson); return }
         foreach ($id in $ids) { Invoke-Cli @('-Pull', $id) }
-        Start-Sleep 1; Refresh-Data -Force
+        Refresh-Data -Force
     })
     $btnOpenFolder.Add_Click({
         $ids = Get-SelectedIds
@@ -674,18 +935,18 @@ function Show-OdsWindow {
     })
     $btnUnmap.Add_Click({
         $ids = Get-SelectedIds
-        if (-not $ids) { [System.Windows.MessageBox]::Show('Select projects to unmap.', 'OneDrive Sync', 'OK', 'Warning') | Out-Null; return }
+        if (-not $ids) { Set-WinStatus 'Select projects to unmap.' ([System.Windows.Media.Brushes]::Crimson); return }
         if (Confirm-Action "Unmap $($ids.Count) project(s) from this machine?`nThe OneDrive copy is kept.") {
             foreach ($id in $ids) { Invoke-Cli @('-Unmap', $id) }
-            Start-Sleep 1; Refresh-Data -Force
+            Refresh-Data -Force
         }
     })
     $btnForget.Add_Click({
         $ids = Get-SelectedIds
-        if (-not $ids) { [System.Windows.MessageBox]::Show('Select projects to retire.', 'OneDrive Sync', 'OK', 'Warning') | Out-Null; return }
+        if (-not $ids) { Set-WinStatus 'Select projects to retire.' ([System.Windows.Media.Brushes]::Crimson); return }
         if (Confirm-Action "Retire $($ids.Count) project(s) globally?`nThis tombstones them (reversible via Show Retired).") {
             foreach ($id in $ids) { Invoke-Cli @('-Forget', $id) }
-            Start-Sleep 1; Refresh-Data -Force
+            Refresh-Data -Force
         }
     })
     $btnConflicts.Add_Click({ Invoke-Cli @('-Conflicts') })
@@ -696,13 +957,13 @@ function Show-OdsWindow {
     $btnSettings.Add_Click({ Show-OdsSettings; $script:Cfg = $null; Refresh-Data -Force })
     $btnProjSettings.Add_Click({
         $ids = @(Get-SelectedIds)
-        if ($ids.Count -ne 1) { [System.Windows.MessageBox]::Show('Select exactly one project.', 'OneDrive Sync', 'OK', 'Warning') | Out-Null; return }
+        if ($ids.Count -ne 1) { Set-WinStatus 'Select exactly one project.' ([System.Windows.Media.Brushes]::Crimson); return }
         Show-OdsProjectSettings -ProjectId $ids[0]
-        Refresh-Data
+        Refresh-Data -Force
     })
     $grid.Add_MouseDoubleClick({
         $ids = @(Get-SelectedIds)
-        if ($ids.Count -eq 1) { Show-OdsProjectSettings -ProjectId $ids[0]; Refresh-Data }
+        if ($ids.Count -eq 1) { Show-OdsProjectSettings -ProjectId $ids[0]; Refresh-Data -Force }
     })
 
     # Register callback so the timer tick can push completed background scans into the grid.
@@ -745,6 +1006,7 @@ $PickerXaml = @'
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="*"/>
       <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
     <TextBlock Grid.Row="0" Text="Select which projects to pull to this machine:"
                Foreground="#333333" Margin="0,0,0,6"/>
@@ -755,7 +1017,9 @@ $PickerXaml = @'
         <StackPanel x:Name="pnlItems" Margin="8"/>
       </ScrollViewer>
     </Border>
-    <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+    <TextBlock Grid.Row="3" x:Name="lblPickerStatus" Foreground="Crimson" FontSize="11"
+               Margin="0,6,0,0" TextWrapping="Wrap"/>
+    <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
       <Button x:Name="btnSkipAll" Content="Skip All" Width="90" Margin="0,0,8,0"
               Background="#5C5C5C" Foreground="White" BorderThickness="0" Padding="0,7" Cursor="Hand"/>
       <Button x:Name="btnOk" Content="Sync Selected" Width="120"
@@ -774,16 +1038,14 @@ function Show-OdsPicker {
         $state.skip   -notcontains $_.id -and
         -not (Test-Path -LiteralPath $_.local)
     })
-    if (-not $undecided) {
-        [System.Windows.MessageBox]::Show('No new projects available.', 'OneDrive Sync', 'OK', 'Information') | Out-Null
-        return
-    }
+    if (-not $undecided) { return }
 
-    $win     = New-WpfWindow $PickerXaml
-    $pnl     = $win.FindName('pnlItems')
-    $btnOk   = $win.FindName('btnOk')
-    $btnSkip = $win.FindName('btnSkipAll')
-    $cbAll   = $win.FindName('cbSelectAll')
+    $win             = New-WpfWindow $PickerXaml
+    $pnl             = $win.FindName('pnlItems')
+    $btnOk           = $win.FindName('btnOk')
+    $btnSkip         = $win.FindName('btnSkipAll')
+    $cbAll           = $win.FindName('cbSelectAll')
+    $lblPickerStatus = $win.FindName('lblPickerStatus')
 
     foreach ($u in $undecided) {
         $cb         = New-Object System.Windows.Controls.CheckBox
@@ -798,10 +1060,7 @@ function Show-OdsPicker {
     $cbAll.Add_Unchecked({ foreach ($cb in $pnl.Children) { $cb.IsChecked = $false } })
 
     $btnOk.Add_Click({
-        if (Test-OdsSyncRunning) {
-            [System.Windows.MessageBox]::Show('A sync is running - please try again in a moment.', 'OneDrive Sync', 'OK', 'Warning') | Out-Null
-            return
-        }
+        if (Test-OdsSyncRunning) { $lblPickerStatus.Text = 'A sync is running - please try again in a moment.'; return }
         foreach ($cb in $pnl.Children) {
             if ($cb.IsChecked) { Invoke-Cli @('-Pull', $cb.Tag) }
             else               { Set-OdsState -Id $cb.Tag -Status skip }
@@ -809,10 +1068,7 @@ function Show-OdsPicker {
         $win.Close()
     })
     $btnSkip.Add_Click({
-        if (Test-OdsSyncRunning) {
-            [System.Windows.MessageBox]::Show('A sync is running - please try again in a moment.', 'OneDrive Sync', 'OK', 'Warning') | Out-Null
-            return
-        }
+        if (Test-OdsSyncRunning) { $lblPickerStatus.Text = 'A sync is running - please try again in a moment.'; return }
         foreach ($cb in $pnl.Children) { Set-OdsState -Id $cb.Tag -Status skip }
         $win.Close()
     })
@@ -853,10 +1109,7 @@ $RetiredXaml = @'
 
 function Show-OdsRetired {
     $cat = Get-OdsCatalog
-    if (-not @($cat.forgotten)) {
-        [System.Windows.MessageBox]::Show('No retired projects.', 'OneDrive Sync', 'OK', 'Information') | Out-Null
-        return
-    }
+    if (-not @($cat.forgotten)) { return }
 
     $win    = New-WpfWindow $RetiredXaml
     $pnl    = $win.FindName('pnlItems')
@@ -930,6 +1183,7 @@ $SettingsXaml = @'
       <RowDefinition Height="*"/>
       <RowDefinition Height="10"/>
       <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
 
@@ -1006,7 +1260,8 @@ $SettingsXaml = @'
     </Grid>
 
     <!-- Save / Cancel -->
-    <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+    <TextBlock Grid.Row="3" x:Name="lblSettingsStatus" FontSize="11" Margin="0,8,0,0" TextWrapping="Wrap"/>
+    <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
       <Button x:Name="btnSettingsCancel" Content="Cancel" Width="90" Margin="0,0,8,0"
               Foreground="White" Background="#5C5C5C" BorderThickness="0" Padding="0,7" Cursor="Hand"/>
       <Button x:Name="btnSettingsSave"   Content="Save"   Width="90"
@@ -1028,6 +1283,7 @@ function Show-OdsSettings {
     $btnRemovePlain    = $win.FindName('btnRemovePlain')
     $btnSettingsSave   = $win.FindName('btnSettingsSave')
     $btnSettingsCancel = $win.FindName('btnSettingsCancel')
+    $lblSettingsStatus = $win.FindName('lblSettingsStatus')
 
     $roots = New-Object 'System.Collections.ObjectModel.ObservableCollection[string]'
     foreach ($r in @($cfg.ProjectParents)) { if ($r) { [void]$roots.Add($r) } }
@@ -1061,9 +1317,13 @@ function Show-OdsSettings {
         foreach ($item in @($gridPlain.SelectedItems)) { [void]$plains.Remove($item) }
     })
     $btnSettingsSave.Add_Click({
-        Save-OdsManagedConfig -ProjectParents @($roots) -PlainFolders @($plains)
-        [System.Windows.MessageBox]::Show('Settings saved. Changes take effect on next sync.', 'OneDrive Sync', 'OK', 'Information') | Out-Null
-        $win.Close()
+        try {
+            Save-OdsManagedConfig -ProjectParents @($roots) -PlainFolders @($plains)
+            $win.Close()
+        } catch {
+            $lblSettingsStatus.Foreground = [System.Windows.Media.Brushes]::Crimson
+            $lblSettingsStatus.Text = $_.Exception.Message
+        }
     })
     $btnSettingsCancel.Add_Click({ $win.Close() })
 

@@ -30,8 +30,11 @@ $WatchRoots = @(
 
 # ── Opt-in PLAIN (non-git) folders: explicit Local<->Dest, no git machinery ────
 # Each entry: @{ Local = "<abs path>"; Dest = "<abs path under OneDrive>" }
+$_claudeSlug = $env:USERPROFILE -replace '[:\\/.]', '-'
 $PlainFolders = @(
     # @{ Local = "$env:USERPROFILE\3D\scripts"; Dest = "$env:OneDriveConsumer\3D printing\scripts" }
+    @{ Local = "$env:USERPROFILE\.claude\projects\$_claudeSlug\memory"
+       Dest  = "$env:OneDriveConsumer\claude-memory" }
 )
 
 # ── Sync rule for UNTRACKED files (tracked files ALWAYS sync) ──────────────────
