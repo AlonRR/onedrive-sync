@@ -136,14 +136,26 @@ function Register-OdsTasks {
     $set = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -RunOnlyIfNetworkAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 60)
     $prin = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
     $task = New-ScheduledTask -Action $a1 -Trigger @($tLogon, $tRepeat) -Settings $set -Principal $prin -Description "OneDrive 2-way sync (every $IntervalMinutes min)."
-    Register-ScheduledTask -TaskName $TaskName -InputObject $task -Force | Out-Null
-    Write-Host "Registered '$TaskName' (logon + every $IntervalMinutes min)." -ForegroundColor Green
+    try {
+        Register-ScheduledTask -TaskName $TaskName -InputObject $task -Force | Out-Null
+        Write-Host "Registered '$TaskName' (logon + every $IntervalMinutes min)." -ForegroundColor Green
+    } catch {
+        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+            Write-Host "Task '$TaskName' already present; couldn't update it ($($_.Exception.Message.Trim())). Keeping the existing task." -ForegroundColor DarkYellow
+        } else { throw }
+    }
 
     $a2 = New-ScheduledTaskAction -Execute $PwshTrayExe -Argument "-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$trayScript`""
     $set2 = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable
     $task2 = New-ScheduledTask -Action $a2 -Trigger (New-ScheduledTaskTrigger -AtLogOn) -Settings $set2 -Principal $prin -Description "OneDrive sync tray helper."
-    Register-ScheduledTask -TaskName $TrayTaskName -InputObject $task2 -Force | Out-Null
-    Write-Host "Registered '$TrayTaskName' (logon)." -ForegroundColor Green
+    try {
+        Register-ScheduledTask -TaskName $TrayTaskName -InputObject $task2 -Force | Out-Null
+        Write-Host "Registered '$TrayTaskName' (logon)." -ForegroundColor Green
+    } catch {
+        if (Get-ScheduledTask -TaskName $TrayTaskName -ErrorAction SilentlyContinue) {
+            Write-Host "Task '$TrayTaskName' already present; couldn't update it ($($_.Exception.Message.Trim())). Keeping the existing task." -ForegroundColor DarkYellow
+        } else { throw }
+    }
 }
 
 # ---------------------------------------------------------------- Run
