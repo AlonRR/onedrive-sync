@@ -135,6 +135,37 @@ function Reset-OdsBaseline {
     }
 }
 
+function Invoke-OdsWithProjectLock {
+    <#
+      Serialize an operation on ONE project's bisync pair/workdir (a manual Sync Now
+      racing the scheduled run) WITHOUT blocking other projects. Lock file sits beside
+      the workdir so Reset-OdsBaseline doesn't disturb it; atomic File.Open(CreateNew),
+      break a presumed-stale lock past the timeout rather than deadlock.
+    #>
+    param([Parameter(Mandatory)][string]$Id, [Parameter(Mandatory)][scriptblock]$Body, [int]$TimeoutMs = 600000)
+    if (-not (Test-Path -LiteralPath $script:OdsBisyncDir)) { New-Item -ItemType Directory -Path $script:OdsBisyncDir -Force | Out-Null }
+    $lock = Join-Path $script:OdsBisyncDir ((Get-OdsIdHash $Id) + '.lock')
+    $handle = $null
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($null -eq $handle) {
+        try {
+            $handle = [System.IO.File]::Open($lock, [System.IO.FileMode]::CreateNew,
+                                             [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        } catch {
+            if ($sw.ElapsedMilliseconds -gt $TimeoutMs) {
+                Write-OdsLog "Project '$Id' lock held >$TimeoutMs ms; breaking presumed-stale lock." 'WARN'
+                Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    try { & $Body } finally {
+        if ($handle) { try { $handle.Close(); $handle.Dispose() } catch {} }
+        Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
+    }
+}
+
 #endregion
 
 # ----------------------------------------------------------------------------
@@ -268,8 +299,10 @@ function Invoke-OdsBisync {
     if ($Force)  { $rcArgs += '--force' }
 
     Write-OdsLog "bisync $($Project.id) [$($mode)]$(if($doResync){' resync'})$(if($DryRun){' dry-run'})" 'INFO'
-    & $rclone @rcArgs
-    $code = $LASTEXITCODE
+    $code = Invoke-OdsWithProjectLock -Id $Project.id -Body {
+        & $rclone @rcArgs | Out-Null
+        $LASTEXITCODE
+    }
     Write-OdsEvent 'bisync' @{ id=$Project.id; code=$code; resync=$doResync; dryrun=[bool]$DryRun }
     return $code
 }

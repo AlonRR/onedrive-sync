@@ -232,7 +232,7 @@ function Unmap-OdsProject {
     param([string]$Id, [hashtable]$Config, [switch]$DeleteLocal)
     $proj = @(Get-OdsProjects -Config $Config) | Where-Object { $_.id -eq $Id } | Select-Object -First 1
     Set-OdsState -Id $Id -Status skip
-    Reset-OdsBaseline -Id $Id
+    Invoke-OdsWithProjectLock -Id $Id -Body { Reset-OdsBaseline -Id $Id }
     if ($DeleteLocal -and $proj -and (Test-Path -LiteralPath $proj.local)) {
         if (Test-OdsIsProtectedRoot $proj.local) {
             throw "Refusing -DeleteLocal for '$Id': '$($proj.local)' is (or contains) a protected root."
