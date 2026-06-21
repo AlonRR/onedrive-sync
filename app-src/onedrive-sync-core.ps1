@@ -107,12 +107,22 @@ function Import-OdsConfig {
 #region  Logging & audit (C)
 # ============================================================================
 
+function Add-OdsContentSafe {
+    <# Append a line, retrying briefly on a sharing violation (another process or
+       rclone holding the same log/JSONL). Logging must never abort a sync run. #>
+    param([string]$Path, [string]$Value)
+    for ($i = 0; $i -lt 6; $i++) {
+        try { Add-Content -LiteralPath $Path -Value $Value -Encoding utf8 -ErrorAction Stop; return }
+        catch { Start-Sleep -Milliseconds (25 * ($i + 1)) }
+    }
+}
+
 function Write-OdsLog {
     param([string]$Message, [ValidateSet('INFO','WARN','ERROR')] [string]$Level = 'INFO')
     Initialize-OdsDirs
     $ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     $line = "$ts [$Level] $Message"
-    Add-Content -LiteralPath $script:OdsLogFile -Value $line -Encoding utf8
+    Add-OdsContentSafe -Path $script:OdsLogFile -Value $line
     if ($Level -eq 'ERROR') { Write-Host $line -ForegroundColor Red }
     elseif ($Level -eq 'WARN') { Write-Host $line -ForegroundColor Yellow }
     else { Write-Verbose $line }
@@ -134,7 +144,7 @@ function Write-OdsEvent {
     }
     foreach ($k in $Data.Keys) { $rec[$k] = $Data[$k] }
     $file = Join-Path $script:OdsEventsDir ("{0}.jsonl" -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd'))
-    Add-Content -LiteralPath $file -Value ($rec | ConvertTo-Json -Compress -Depth 6) -Encoding utf8
+    Add-OdsContentSafe -Path $file -Value ($rec | ConvertTo-Json -Compress -Depth 6)
 }
 
 #endregion
