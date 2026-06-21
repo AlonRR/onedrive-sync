@@ -303,8 +303,19 @@ function Invoke-OdsBisync {
 
     Write-OdsLog "bisync $($Project.id) [$($mode)]$(if($doResync){' resync'})$(if($DryRun){' dry-run'})" 'INFO'
     $code = Invoke-OdsWithProjectLock -Id $Project.id -Body {
-        & $rclone @rcArgs | Out-Null
-        $LASTEXITCODE
+        # Run rclone as a child we can watchdog — a hung bisync must not hold the
+        # project lock indefinitely. Quote args (local/dest paths may contain spaces).
+        $quoted = ($rcArgs | ForEach-Object { if ("$_" -match '[\s"]') { '"' + ("$_" -replace '"', '\"') + '"' } else { "$_" } }) -join ' '
+        $p = Start-Process -FilePath $rclone -ArgumentList $quoted -NoNewWindow -PassThru
+        $timeoutSec = [int][math]::Max(1800, [int]$Config.RunTimeBudget)
+        if ($p.WaitForExit($timeoutSec * 1000)) {
+            $p.ExitCode
+        } else {
+            Write-OdsLog "bisync $($Project.id) exceeded ${timeoutSec}s — killing rclone (pid $($p.Id))." 'ERROR'
+            try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {}
+            try { [void]$p.WaitForExit(5000) } catch {}
+            9
+        }
     }
     Write-OdsEvent 'bisync' @{ id=$Project.id; code=$code; resync=$doResync; dryrun=[bool]$DryRun }
     return $code
