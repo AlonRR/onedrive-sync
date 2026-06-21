@@ -132,10 +132,23 @@ function Read-OdsFolderDialog {
 }
 
 function Resolve-OdsId {
-    param([string]$Partial, [hashtable]$Config)
+    <#
+      Resolve a (possibly partial) id. An EXACT id always wins. A partial matching
+      exactly one project resolves to it. A partial matching several is ambiguous:
+      -Destructive throws (never delete/overwrite the wrong project); otherwise the
+      first match is returned (legacy convenience).
+    #>
+    param([string]$Partial, [hashtable]$Config, [switch]$Destructive)
     if (-not $Partial) { return $Partial }
-    $proj = @(Get-OdsProjects -Config $Config) | Where-Object { $_.id -eq $Partial -or $_.id -like "*$Partial*" } | Select-Object -First 1
-    if ($proj) { return $proj.id }
+    $all   = @(Get-OdsProjects -Config $Config)
+    $exact = @($all | Where-Object { $_.id -eq $Partial })
+    if ($exact.Count -ge 1) { return $exact[0].id }
+    $hits  = @($all | Where-Object { $_.id -like "*$Partial*" })
+    if ($hits.Count -eq 1) { return $hits[0].id }
+    if ($hits.Count -gt 1) {
+        if ($Destructive) { throw "'$Partial' is ambiguous — matches $($hits.Count) projects: $(($hits | ForEach-Object { $_.id }) -join ', '). Use the exact id." }
+        return $hits[0].id
+    }
     return $Partial
 }
 
@@ -170,7 +183,8 @@ switch ($true) {
             $cfg2 = $cfg.Clone(); if ($ApproveDeletes) { $cfg2.MaxDeletePercent = 100 }
             Invoke-OdsRun -Config $cfg2 | Out-Null
         } else {
-            $proj = @(Get-OdsProjects -Config $cfg) | Where-Object { $_.id -like "*$SyncNow*" } | Select-Object -First 1
+            $rid  = Resolve-OdsId $SyncNow $cfg
+            $proj = @(Get-OdsProjects -Config $cfg) | Where-Object { $_.id -eq $rid } | Select-Object -First 1
             if (-not $proj) { Write-Host "No project matching '$SyncNow'." -ForegroundColor Yellow; break }
             $cfg2 = $cfg.Clone(); if ($ApproveDeletes) { $cfg2.MaxDeletePercent = 100 }
             Sync-OdsProject -Project $proj -Config $cfg2 | Format-List
@@ -179,8 +193,8 @@ switch ($true) {
     }
 
     { $Pull }    { (Pull-OdsProject  -Id (Resolve-OdsId $Pull $cfg)  -Config $cfg) | Format-List; break }
-    { $Unmap }   {  Unmap-OdsProject -Id (Resolve-OdsId $Unmap $cfg) -Config $cfg -DeleteLocal:$DeleteLocal; break }
-    { $Forget }  {  Forget-OdsProject -Id (Resolve-OdsId $Forget $cfg) -Config $cfg; break }
+    { $Unmap }   {  Unmap-OdsProject -Id (Resolve-OdsId $Unmap $cfg -Destructive) -Config $cfg -DeleteLocal:$DeleteLocal; break }
+    { $Forget }  {  Forget-OdsProject -Id (Resolve-OdsId $Forget $cfg -Destructive) -Config $cfg; break }
 
     { $PSBoundParameters.ContainsKey('Resync') } {
         if (-not $Resync -or $Resync -eq '*') {
@@ -189,7 +203,8 @@ switch ($true) {
                 Invoke-OdsBisync -Project $proj -Config $cfg -Resync | Out-Null
             }
         } else {
-            $proj = @(Get-OdsProjects -Config $cfg) | Where-Object { $_.id -like "*$Resync*" } | Select-Object -First 1
+            $rid  = Resolve-OdsId $Resync $cfg
+            $proj = @(Get-OdsProjects -Config $cfg) | Where-Object { $_.id -eq $rid } | Select-Object -First 1
             if ($proj) { Invoke-OdsBisync -Project $proj -Config $cfg -Resync | Out-Null } else { Write-Host "No match." -ForegroundColor Yellow }
         }
         break
@@ -206,7 +221,7 @@ switch ($true) {
         break
     }
 
-    { $Restore } { Restore-OdsItem -Id (Resolve-OdsId $Restore $cfg) -Config $cfg -At $At -File $File; break }
+    { $Restore } { Restore-OdsItem -Id (Resolve-OdsId $Restore $cfg -Destructive) -Config $cfg -At $At -File $File; break }
 
     { $Diag } {
         $bundle = Join-Path $env:TEMP ("onedrive-sync-diag-{0}.txt" -f (Get-Date).ToString('yyyyMMdd-HHmmss'))
