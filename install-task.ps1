@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Installs (or removes) the OneDrive 2-way sync tool on this machine.
 
@@ -130,7 +130,9 @@ function Register-OdsTasks {
 
     $a1 = New-ScheduledTaskAction -Execute $PwshExe -Argument "-NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$syncScript`""
     $tLogon  = New-ScheduledTaskTrigger -AtLogOn
-    $tRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes) -RepetitionDuration ([timespan]::MaxValue)
+    # Finite (10-year) duration — [timespan]::MaxValue is rejected/clamped by Task
+    # Scheduler on some Windows builds, making the repetition silently never arm.
+    $tRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes) -RepetitionDuration (New-TimeSpan -Days 3650)
     $set = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -RunOnlyIfNetworkAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 60)
     $prin = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
     $task = New-ScheduledTask -Action $a1 -Trigger @($tLogon, $tRepeat) -Settings $set -Principal $prin -Description "OneDrive 2-way sync (every $IntervalMinutes min)."
