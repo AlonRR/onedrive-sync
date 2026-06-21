@@ -39,6 +39,16 @@ public static class Win32Icon {
 # Ensure a WPF Application context exists (needed for WPF windows in a WinForms host).
 if (-not [System.Windows.Application]::Current) { $null = New-Object System.Windows.Application }
 
+# Single instance: a second launch (e.g. the Start Menu shortcut) signals the running
+# tray to open its window instead of adding a duplicate tray icon, then exits.
+$script:OdsInstanceNew   = $false
+$script:OdsInstanceMutex = New-Object System.Threading.Mutex($true, 'Local\OneDriveCodeSyncTray', [ref]$script:OdsInstanceNew)
+$script:OdsShowEvent     = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\OneDriveCodeSyncTrayShow')
+if (-not $script:OdsInstanceNew) {
+    if ($ShowWindow) { [void]$script:OdsShowEvent.Set() }
+    return
+}
+
 $script:Cfg            = $null
 $script:CachedRows     = $null   # [object[]] populated by background runspace; $null = not ready yet
 $script:RefreshHandle  = $null   # { PS, Async, RS } active background status job
@@ -883,7 +893,9 @@ function Show-OdsWindow {
         # Merge fresh per-project last-sync times into display rows (creates new objects; does not mutate cache)
         $src = [object[]]@($base | ForEach-Object {
             [PSCustomObject]@{
-                Dot          = $_.Dot
+                # Recompute Dot if a cached row lacks it (defensive: a missing property
+                # would otherwise throw under StrictMode and crash the refresh).
+                Dot          = if ($_.PSObject.Properties['Dot']) { $_.Dot } else { Get-StatusBrush $_.Status $_.Conflicts }
                 Id           = $_.Id
                 Status       = $_.Status
                 Kind         = $_.Kind
@@ -1388,7 +1400,7 @@ $icon.Visible = $true
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 [void]$menu.Items.Add('Sync all now',           $null, { Invoke-Cli @('-SyncNow', '*'); $script:SyncStartedAt = [datetime]::Now; Update-TrayIcon })
-[void]$menu.Items.Add('Manage...',              $null, { Show-OdsWindow })
+[void]$menu.Items.Add('Manage...',              $null, { try { Show-OdsWindow } catch {} })
 [void]$menu.Items.Add('Choose new projects...', $null, { Show-OdsPicker })
 [void]$menu.Items.Add('Settings...',           $null, { Show-OdsSettings; $script:Cfg = $null })
 [void]$menu.Items.Add('-')
@@ -1402,7 +1414,7 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
     [System.Windows.Forms.Application]::Exit()
 })
 $icon.ContextMenuStrip = $menu
-$icon.Add_MouseClick({ if ($_.Button -eq 'Left') { Show-OdsWindow } })
+$icon.Add_MouseClick({ if ($_.Button -eq 'Left') { try { Show-OdsWindow } catch {} } })
 
 # Background status refresh + pending project balloon.
 $timer = New-Object System.Windows.Forms.Timer
@@ -1484,6 +1496,15 @@ try {
 } catch { $script:LastRunEndTs = '' }
 $icon.Add_BalloonTipClicked({ Show-OdsPicker })
 
-if ($ShowWindow) { Show-OdsWindow }
+# Poll the show-window signal on the UI thread; a second launch sets it (see top).
+$script:OdsShowTimer = New-Object System.Windows.Forms.Timer
+$script:OdsShowTimer.Interval = 500
+$script:OdsShowTimer.Add_Tick({
+    # Guard like the main timer: a failure opening the window must never crash the tray.
+    try { if ($script:OdsShowEvent.WaitOne(0)) { Show-OdsWindow } } catch { }
+})
+$script:OdsShowTimer.Start()
+
+if ($ShowWindow) { try { Show-OdsWindow } catch {} }
 [System.Windows.Forms.Application]::Run()
 $icon.Visible = $false
