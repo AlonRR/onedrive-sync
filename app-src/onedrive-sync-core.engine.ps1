@@ -20,7 +20,14 @@ function Get-OdsGit {
 function Invoke-OdsGit {
     param([string]$RepoDir, [string[]]$GitArgs)
     $git = Get-OdsGit
-    $out = & $git -C $RepoDir @GitArgs 2>$null
+    # A git warning/error on stderr (e.g. a repo with a dangling origin/HEAD) must NOT
+    # abort the run: under Windows PowerShell 5.1 with $ErrorActionPreference='Stop',
+    # native stderr becomes a terminating NativeCommandError even with 2>$null. Force
+    # Continue for this call and judge success by the exit code only.
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { $out = & $git -C $RepoDir @GitArgs 2>$null }
+    finally { $ErrorActionPreference = $prev }
     [pscustomobject]@{ Code = $LASTEXITCODE; Output = (($out | Out-String).TrimEnd("`r","`n")) }
 }
 #endregion
