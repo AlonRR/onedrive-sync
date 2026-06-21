@@ -49,6 +49,10 @@ if ($Uninstall) {
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -match 'onedrive-sync-tray' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\OneDrive Code Sync.lnk'
+    if (Test-Path $lnk) { Remove-Item $lnk -Force -ErrorAction SilentlyContinue; Write-Host "Removed Start Menu shortcut." -ForegroundColor Green }
+    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\OneDriveCodeSync'
+    if (Test-Path $key) { Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue; Write-Host "Removed Installed-Apps entry." -ForegroundColor Green }
     $bisync = Join-Path $LocalRoot 'bisync'
     if (Test-Path $bisync) { Remove-Item $bisync -Recurse -Force -ErrorAction SilentlyContinue }
     $ans = Read-Host "Also delete local version archive + state at $LocalRoot ? (y/N)"
@@ -158,12 +162,71 @@ function Register-OdsTasks {
     }
 }
 
+# ---------------------------------------------------------------- Windows program
+function Register-OdsProgram {
+    $startMenu  = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+    $lnk        = Join-Path $startMenu 'OneDrive Code Sync.lnk'
+    $trayScript = Join-Path $AppDir 'onedrive-sync-tray.ps1'
+    $icoPath    = Join-Path $AppDir 'onedrive-sync.ico'
+
+    # 1) A branded .ico (green circle, like the tray's "ok" icon). Fall back to the
+    #    shell exe's own icon if System.Drawing can't write one.
+    $displayIcon = $icoPath
+    try {
+        Add-Type -AssemblyName System.Drawing
+        $bmp = New-Object System.Drawing.Bitmap 32, 32
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.Clear([System.Drawing.Color]::Transparent)
+        $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(16, 124, 16))
+        $g.FillEllipse($brush, 3, 3, 26, 26)
+        $g.Dispose(); $brush.Dispose()
+        $icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+        $fs = [System.IO.File]::Create($icoPath)
+        try { $icon.Save($fs) } finally { $fs.Close() }
+        $icon.Dispose(); $bmp.Dispose()
+    } catch {
+        $displayIcon = (Get-Command $PwshTrayExe).Source
+    }
+
+    # 2) Start Menu shortcut -> opens the management window (single-instance aware,
+    #    so it surfaces the running tray rather than starting a second one).
+    $ws = New-Object -ComObject WScript.Shell
+    $sc = $ws.CreateShortcut($lnk)
+    $sc.TargetPath       = (Get-Command $PwshTrayExe).Source
+    $sc.Arguments        = "-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$trayScript`" -ShowWindow"
+    $sc.WorkingDirectory = $AppDir
+    $sc.IconLocation     = "$displayIcon,0"
+    $sc.Description       = 'OneDrive 2-way code sync - open the management window'
+    $sc.Save()
+    Write-Host "Start Menu shortcut: $lnk" -ForegroundColor Green
+
+    # 3) Installed Apps (Settings > Apps) / Add-Remove-Programs entry + uninstaller.
+    $verFile = Join-Path $AppDir 'VERSION'
+    $ver = if (Test-Path $verFile) { (Get-Content $verFile -Raw).Trim() } else { '1.0' }
+    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\OneDriveCodeSync'
+    New-Item -Path $key -Force | Out-Null
+    $uninstall = "`"$((Get-Command powershell.exe).Source)`" -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Uninstall"
+    $sizeKb = [int]((Get-ChildItem $AppDir -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1KB)
+    Set-ItemProperty $key DisplayName     'OneDrive Code Sync'
+    Set-ItemProperty $key DisplayVersion  $ver
+    Set-ItemProperty $key Publisher       'Alon A. Rabinowitz'
+    Set-ItemProperty $key DisplayIcon     $displayIcon
+    Set-ItemProperty $key InstallLocation $AppDir
+    Set-ItemProperty $key UninstallString $uninstall
+    Set-ItemProperty $key NoModify 1 -Type DWord
+    Set-ItemProperty $key NoRepair 1 -Type DWord
+    if ($sizeKb -gt 0) { Set-ItemProperty $key EstimatedSize $sizeKb -Type DWord }
+    Write-Host "Registered in Installed Apps (Add/Remove Programs)." -ForegroundColor Green
+}
+
 # ---------------------------------------------------------------- Run
 Install-OdsGit
 Install-OdsRclone
 Update-OdsFromOldTool
 Copy-OdsApp
 Register-OdsTasks
+Register-OdsProgram
 
 Write-Host ""
 Write-Host "Installed." -ForegroundColor Green
