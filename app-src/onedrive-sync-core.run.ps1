@@ -155,7 +155,8 @@ function Invoke-OdsRun {
         if ($deferred.Count -gt 0 -and -not $DryRun) {
             $waited = 0; $attempt = 0
             while ($deferred.Count -gt 0 -and $attempt -lt $Config.RetryMaxAttempts -and $waited -lt $Config.RetryMaxWaitSeconds -and (Get-Date) -lt $deadline) {
-                $sleep = $Config.RetryBackoff[[math]::Min($attempt, $Config.RetryBackoff.Count-1)]
+                $bo = @($Config.RetryBackoff); if ($bo.Count -eq 0) { $bo = @(5,10,20) }
+                $sleep = [int]$bo[[math]::Min($attempt, $bo.Count - 1)]
                 Start-Sleep -Seconds $sleep; $waited += $sleep; $attempt++
                 $still = [System.Collections.Generic.List[object]]::new()
                 foreach ($p in $deferred) {
