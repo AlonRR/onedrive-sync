@@ -281,6 +281,11 @@ function Merge-OdsCatalog {
     $byId = @{}
     foreach ($e in @($A.entries) + @($B.entries)) { if ($e) { $byId[$e.id] = $e } }
     $forgotten = @(@($A.forgotten) + @($B.forgotten) | Where-Object { $_ } | Sort-Object -Unique)
+    # A live entry wins over a tombstone: never re-retire an id present in entries
+    # (a stale conflict copy must not resurrect a tombstone for a revived project).
+    $live = @{}
+    foreach ($e in $byId.Values) { if ($e -and $e.id) { $live[$e.id] = $true } }
+    $forgotten = @($forgotten | Where-Object { -not $live.ContainsKey($_) })
     [pscustomobject]@{ entries = @($byId.Values); forgotten = $forgotten }
 }
 
