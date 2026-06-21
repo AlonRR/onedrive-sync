@@ -845,6 +845,9 @@ function Show-OdsWindow {
             # Async path: null cache, restart background scan, show placeholder, return immediately.
             $script:CachedRows = $null
             if ($null -ne $script:RefreshHandle) {
+                # Stop the in-flight pipeline before disposing, else the runspace
+                # worker thread is abandoned (a slow leak on every force-refresh).
+                try { $script:RefreshHandle.PS.Stop() }    catch {}
                 try { $script:RefreshHandle.PS.Dispose() } catch {}
                 try { $script:RefreshHandle.RS.Dispose() } catch {}
                 $script:RefreshHandle = $null
