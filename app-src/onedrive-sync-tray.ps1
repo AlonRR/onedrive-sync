@@ -1459,12 +1459,10 @@ $timer.Add_Tick({
             Update-TrayIcon
         }
         # Pending project balloon notification
+        # Read-OdsJson is corruption/lock tolerant — a partial or locked pending.json
+        # must not throw out of the timer tick under ErrorActionPreference='Stop'.
         $pendingFile = Join-Path $env:LOCALAPPDATA 'onedrive-sync\pending.json'
-        $n = 0
-        if (Test-Path $pendingFile) {
-            $parsed = Get-Content $pendingFile -Raw | ConvertFrom-Json
-            $n = if ($null -eq $parsed) { 0 } else { @($parsed).Count }
-        }
+        $n = @(Read-OdsJson -Path $pendingFile -Default @()).Count
         if ($n -ne $script:LastPending) {
             $oldPending = $script:LastPending
             $script:LastPending = $n
