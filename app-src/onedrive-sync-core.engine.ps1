@@ -294,7 +294,10 @@ function Invoke-OdsBisync {
         '--log-file', $script:OdsLogFile,
         '--log-level','INFO'
     )
-    if ($doResync) { $rcArgs += '--resync' }
+    # Plain --resync == --resync-mode path1 (local always wins), which silently
+    # overwrites a newer OneDrive edit whenever a resync is forced (e.g. a routine
+    # filter/.gitignore change). --resync-mode newer keeps the newer side instead.
+    if ($doResync) { $rcArgs += @('--resync', '--resync-mode', 'newer') }
     if ($DryRun) { $rcArgs += '--dry-run' }
     if ($Force)  { $rcArgs += '--force' }
 
