@@ -626,13 +626,19 @@ function Show-OdsProjectSettings {
             if ($pathsChanged) {
                 if (-not $newLocal) { throw 'Local folder path cannot be empty.' }
                 if (-not $newDest)  { throw 'OneDrive folder path cannot be empty.' }
+                if ((Test-OdsIsProtectedRoot $newLocal) -or (Test-OdsIsProtectedRoot $newDest)) {
+                    throw 'Local or OneDrive folder is a protected root — refused.'
+                }
+                if (Test-OdsOverlap $newLocal $newDest) {
+                    throw 'Local and OneDrive folders overlap — refused (would self-sync).'
+                }
 
                 if ($proj.kind -eq 'watch') {
                     $up = $env:USERPROFILE.TrimEnd('\')
                     $newLocalRel = Get-OdsRelUnder -Full $newLocal -Root $up
                     $newDestRel  = Get-OdsRelUnder -Full $newDest  -Root $od
-                    if ($null -eq $newLocalRel) { throw "Local folder must be under your user profile ($up)." }
-                    if ($null -eq $newDestRel)  { throw "OneDrive folder must be under the OneDrive root ($od)." }
+                    if ([string]::IsNullOrEmpty($newLocalRel)) { throw "Local folder must be a folder UNDER your user profile ($up)." }
+                    if ([string]::IsNullOrEmpty($newDestRel))  { throw "OneDrive folder must be a folder UNDER the OneDrive root ($od)." }
 
                     $catalog = Get-OdsCatalog
                     $entry = @($catalog.entries) | Where-Object { $_.id -eq $ProjectId } | Select-Object -First 1
