@@ -30,6 +30,14 @@ function Invoke-OdsGit {
 # ----------------------------------------------------------------------------
 function ConvertTo-OdsFilterPath { param([string]$p) ($p -replace '\\','/') }
 
+function ConvertTo-OdsFilterLiteral {
+    # Escape rclone filter glob metacharacters (* ? [ ] { }) so a discovered file
+    # path is matched LITERALLY. Apply only to git-derived paths, never to
+    # user-supplied Exclude/SyncAnyway globs (where wildcards are intended).
+    param([string]$p)
+    ($p -replace '([*?\[\]{}])', '\$1')
+}
+
 function Test-OdsMatchesExclude {
     param([string]$RelPath, [string[]]$ExcludeDirs, [string[]]$ExcludeFiles)
     $segs = ($RelPath -replace '\\','/').Split('/')
@@ -69,7 +77,7 @@ function New-OdsFilterFile {
         }
         foreach ($t in $tracked) {
             if (Test-OdsMatchesExclude -RelPath $t -ExcludeDirs $Config.ExcludeDirs -ExcludeFiles $Config.ExcludeFiles) {
-                $lines.Add("+ /" + (ConvertTo-OdsFilterPath $t))
+                $lines.Add("+ /" + (ConvertTo-OdsFilterLiteral (ConvertTo-OdsFilterPath $t)))
             }
         }
     }
@@ -88,7 +96,7 @@ function New-OdsFilterFile {
         $r = Invoke-OdsGit -RepoDir $Project.local -GitArgs @('ls-files','--others','--ignored','--exclude-standard','--directory','-z')
         if ($r.Code -eq 0 -and $r.Output) {
             foreach ($p in ($r.Output.Split([char]0) | Where-Object { $_ })) {
-                $fp = ConvertTo-OdsFilterPath $p
+                $fp = ConvertTo-OdsFilterLiteral (ConvertTo-OdsFilterPath $p)
                 if ($fp.EndsWith('/')) { $lines.Add("- /$fp**") } else { $lines.Add("- /$fp") }
             }
         }
