@@ -298,14 +298,36 @@ function Get-OdsProjectStatus {
     }
 }
 
+function Get-OdsRunStamp {
+    # Parse the UTC timestamp from an archive run-dir name (bare 'yyyyMMddTHHmmssZ',
+    # or a 'seed-' / 'pre-restore-' prefix). Unparseable -> DateTime.MinValue.
+    param([string]$Name)
+    $core = $Name -replace '^(seed|pre-restore)-', ''
+    $dt = [datetime]::MinValue
+    $ok = [datetime]::TryParseExact($core, 'yyyyMMddTHHmmssZ', [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal, [ref]$dt)
+    if ($ok) { return $dt } else { return [datetime]::MinValue }
+}
+
 function Restore-OdsItem {
     <# Restore a file/subpath/whole project from the local version archive (G). #>
     param([string]$Id, [hashtable]$Config, [string]$At, [string]$File)
+    if ($File -and ($File -match '(^|[\\/])\.\.([\\/]|$)')) { throw "Invalid -File '$File' ('..' is not allowed)." }
     $idHash = Get-OdsIdHash $Id
     $base = Join-Path $script:OdsVersionsDir $idHash
     if (-not (Test-Path -LiteralPath $base)) { throw "No local versions for '$Id'. Try OneDrive version history." }
-    $runs = Get-ChildItem -LiteralPath $base -Directory | Sort-Object Name -Descending
-    if ($At) { $runs = $runs | Where-Object { $_.Name -le ($At -replace '[:\-]','') } }
+    # Sort by PARSED timestamp, not raw name — else 'seed-*' sorts lexically ahead of
+    # bare-timestamp backups and a plain restore returns the partial seed snapshot.
+    $runs = @(Get-ChildItem -LiteralPath $base -Directory | Where-Object { $_.Name -notlike 'pre-restore-*' }) |
+            Sort-Object @{ Expression = { Get-OdsRunStamp $_.Name } } -Descending
+    if ($At) {
+        $atDt = [datetime]::MinValue
+        if (-not [datetime]::TryParse($At, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeLocal, [ref]$atDt)) {
+            throw "Could not parse -At '$At' as a date/time."
+        }
+        $atUtc = $atDt.ToUniversalTime()
+        $runs = @($runs | Where-Object { (Get-OdsRunStamp $_.Name) -le $atUtc })
+    }
     $run = $runs | Select-Object -First 1
     if (-not $run) { throw "No archived version at/before '$At'." }
     $proj = @(Get-OdsProjects -Config $Config) | Where-Object { $_.id -eq $Id } | Select-Object -First 1
@@ -313,6 +335,19 @@ function Restore-OdsItem {
     $src = if ($File) { Join-Path $run.FullName $File } else { $run.FullName }
     if (-not (Test-Path -LiteralPath $src)) { throw "Not in archive run $($run.Name): $File" }
     $dst = if ($File) { Join-Path $proj.local $File } else { $proj.local }
+
+    # Back up current content before clobbering, so a wrong restore is undoable.
+    if (Test-Path -LiteralPath $dst) {
+        try {
+            $preDir = Join-Path $base ('pre-restore-' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))
+            $preTarget = if ($File) { Join-Path $preDir $File } else { $preDir }
+            $ptd = Split-Path -Parent $preTarget
+            if (-not (Test-Path -LiteralPath $ptd)) { New-Item -ItemType Directory -Path $ptd -Force | Out-Null }
+            Copy-Item -LiteralPath $dst -Destination $preTarget -Recurse -Force
+            Write-OdsLog "Backed up current '$Id' to $(Split-Path $preDir -Leaf) before restore." 'INFO'
+        } catch { Write-OdsLog "Pre-restore backup of '$Id' failed: $($_.Exception.Message). Proceeding." 'WARN' }
+    }
+
     Write-OdsLog "Restoring $Id $(if($File){$File}else{'(whole)'}) from $($run.Name)." 'INFO'
     Copy-Item -LiteralPath $src -Destination $dst -Recurse -Force
     Write-OdsEvent 'restore' @{ id=$Id; run=$run.Name; file=$File }
