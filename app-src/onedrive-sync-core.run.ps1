@@ -292,10 +292,14 @@ function Add-OdsWatchMapping {
 function Get-OdsProjectStatus {
     param([hashtable]$Config)
     $state = Get-OdsMachineState
+    $activeSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($a in @($state.active)) { [void]$activeSet.Add($a) }
+    $skipSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($sk in @($state.skip)) { [void]$skipSet.Add($sk) }
     $projects = @(Get-OdsProjects -Config $Config)
     foreach ($p in $projects) {
-        $status = if ($state.active -contains $p.id) { 'active' }
-                  elseif ($state.skip -contains $p.id) { 'skip' } else { 'undecided' }
+        $status = if ($activeSet.Contains($p.id)) { 'active' }
+                  elseif ($skipSet.Contains($p.id)) { 'skip' } else { 'undecided' }
         [pscustomobject]@{
             Id=$p.id; Name=$p.name; Kind=$p.kind; Git=$p.git; Status=$status
             Local=$p.local; LocalPresent=(Test-Path -LiteralPath $p.local)
