@@ -36,6 +36,7 @@ $script:OdsEventsDir   = Join-Path $script:OdsLocalRoot 'events'
 $script:OdsLogDir      = Join-Path $script:OdsLocalRoot 'logs'
 $script:OdsLockFile    = Join-Path $script:OdsLocalRoot '.lock'
 $script:OdsMachineState= Join-Path $script:OdsLocalRoot 'machine-state.json'
+$script:OdsStateLock   = (Join-Path $script:OdsLocalRoot 'machine-state.json') + '.lock'
 $script:OdsPending     = Join-Path $script:OdsLocalRoot 'pending.json'
 $script:OdsLogFile     = Join-Path $script:OdsLogDir 'sync.log'
 
@@ -255,14 +256,49 @@ function Get-OdsMachineState {
 }
 function Save-OdsMachineState { param($State) Write-OdsJson -Path $script:OdsMachineState -Object $State }
 
+function Edit-OdsMachineState {
+    <#
+      Read-modify-write machine-state.json under a cross-process atomic file lock so
+      the tray (its own process) and a scheduled run cannot clobber each other.
+      Acquire via File.Open(CreateNew) (no Test-Path TOCTOU); a presumed-stale lock
+      past the timeout is broken and we proceed best-effort rather than crash.
+    #>
+    param([Parameter(Mandatory)][scriptblock]$Mutate, [int]$TimeoutMs = 5000)
+    Initialize-OdsDirs
+    $handle = $null
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($null -eq $handle) {
+        try {
+            $handle = [System.IO.File]::Open($script:OdsStateLock, [System.IO.FileMode]::CreateNew,
+                                             [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        } catch {
+            if ($sw.ElapsedMilliseconds -gt $TimeoutMs) {
+                Write-OdsLog "machine-state lock held >$TimeoutMs ms; breaking presumed-stale lock." 'WARN'
+                Remove-Item -LiteralPath $script:OdsStateLock -Force -ErrorAction SilentlyContinue
+                break
+            }
+            Start-Sleep -Milliseconds 40
+        }
+    }
+    try {
+        $s = Get-OdsMachineState
+        & $Mutate $s
+        Save-OdsMachineState $s
+    } finally {
+        if ($handle) { try { $handle.Close(); $handle.Dispose() } catch {} }
+        Remove-Item -LiteralPath $script:OdsStateLock -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Set-OdsState {
     param([string]$Id, [ValidateSet('active','skip','undecided')] [string]$Status)
-    $s = Get-OdsMachineState
-    $s.active = @($s.active | Where-Object { $_ -ne $Id })
-    $s.skip   = @($s.skip   | Where-Object { $_ -ne $Id })
-    if ($Status -eq 'active') { $s.active = @($s.active) + $Id }
-    elseif ($Status -eq 'skip') { $s.skip = @($s.skip) + $Id }
-    Save-OdsMachineState $s
+    Edit-OdsMachineState -Mutate {
+        param($s)
+        $s.active = @($s.active | Where-Object { $_ -ne $Id })
+        $s.skip   = @($s.skip   | Where-Object { $_ -ne $Id })
+        if ($Status -eq 'active') { $s.active = @($s.active) + $Id }
+        elseif ($Status -eq 'skip') { $s.skip = @($s.skip) + $Id }
+    }
 }
 
 function Move-OdsProjectState {
@@ -274,32 +310,34 @@ function Move-OdsProjectState {
     #>
     param([Parameter(Mandatory)][string]$FromId, [Parameter(Mandatory)][string]$ToId)
     if ($FromId -eq $ToId) { return }
-    $s = Get-OdsMachineState
-    if ($s.active -contains $FromId) { $s.active = @($s.active | Where-Object { $_ -ne $FromId }) + $ToId }
-    if ($s.skip   -contains $FromId) { $s.skip   = @($s.skip   | Where-Object { $_ -ne $FromId }) + $ToId }
-    if ($null -ne $s.deferred.PSObject.Properties[$FromId]) {
-        $s.deferred | Add-Member -NotePropertyName $ToId -NotePropertyValue $s.deferred.$FromId -Force
-        $s.deferred.PSObject.Properties.Remove($FromId)
+    Edit-OdsMachineState -Mutate {
+        param($s)
+        if ($s.active -contains $FromId) { $s.active = @($s.active | Where-Object { $_ -ne $FromId }) + $ToId }
+        if ($s.skip   -contains $FromId) { $s.skip   = @($s.skip   | Where-Object { $_ -ne $FromId }) + $ToId }
+        if ($null -ne $s.deferred.PSObject.Properties[$FromId]) {
+            $s.deferred | Add-Member -NotePropertyName $ToId -NotePropertyValue $s.deferred.$FromId -Force
+            $s.deferred.PSObject.Properties.Remove($FromId)
+        }
+        $s.compare.PSObject.Properties.Remove($FromId)
+        $s.maxDelete.PSObject.Properties.Remove($FromId)
     }
-    $s.compare.PSObject.Properties.Remove($FromId)
-    $s.maxDelete.PSObject.Properties.Remove($FromId)
-    Save-OdsMachineState $s
 }
 
 function Set-OdsProjectSettings {
     param([string]$Id, [string]$CompareMode, [object]$MaxDelete)
-    $s = Get-OdsMachineState
-    if ($CompareMode) {
-        $s.compare | Add-Member -NotePropertyName $Id -NotePropertyValue $CompareMode -Force
-    } else {
-        $s.compare.PSObject.Properties.Remove($Id)
+    Edit-OdsMachineState -Mutate {
+        param($s)
+        if ($CompareMode) {
+            $s.compare | Add-Member -NotePropertyName $Id -NotePropertyValue $CompareMode -Force
+        } else {
+            $s.compare.PSObject.Properties.Remove($Id)
+        }
+        if ($null -ne $MaxDelete) {
+            $s.maxDelete | Add-Member -NotePropertyName $Id -NotePropertyValue ([int]$MaxDelete) -Force
+        } else {
+            $s.maxDelete.PSObject.Properties.Remove($Id)
+        }
     }
-    if ($null -ne $MaxDelete) {
-        $s.maxDelete | Add-Member -NotePropertyName $Id -NotePropertyValue ([int]$MaxDelete) -Force
-    } else {
-        $s.maxDelete.PSObject.Properties.Remove($Id)
-    }
-    Save-OdsMachineState $s
 }
 
 #endregion

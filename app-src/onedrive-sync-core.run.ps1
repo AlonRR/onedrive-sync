@@ -49,14 +49,16 @@ function Sync-OdsProject {
 # ----------------------------------------------------------------------------
 function Invoke-OdsReconcile {
     param([hashtable]$Config, [object[]]$Projects)
-    $state = Get-OdsMachineState
     $validIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($p in $Projects) { [void]$validIds.Add($p.id) }
 
     # prune machine-state entries for ids that no longer exist (E64)
-    $state.active = @($state.active | Where-Object { $validIds.Contains($_) })
-    $state.skip   = @($state.skip   | Where-Object { $validIds.Contains($_) })
-    Save-OdsMachineState $state
+    Edit-OdsMachineState -Mutate {
+        param($state)
+        $state.active = @($state.active | Where-Object { $validIds.Contains($_) })
+        $state.skip   = @($state.skip   | Where-Object { $validIds.Contains($_) })
+    }
+    $state = Get-OdsMachineState
 
     # vanished side detection (E48/E68/E69): handled lazily in the run loop, but
     # warn here for visibility.
@@ -191,14 +193,15 @@ function Get-OdsLastChange {
 
 function Update-OdsDeferCount {
     param([string]$Id, [hashtable]$Config)
-    $s = Get-OdsMachineState
-    $n = 1
-    if ($null -ne $s.deferred.PSObject.Properties[$Id]) { $n = [int]$s.deferred.$Id + 1 }
-    $s.deferred | Add-Member -NotePropertyName $Id -NotePropertyValue $n -Force
-    if ($n -ge $Config.DeferEscalateCycles) {
-        Write-OdsLog "ESCALATION: $Id deferred $n consecutive cycles — needs attention." 'ERROR'
+    Edit-OdsMachineState -Mutate {
+        param($s)
+        $n = 1
+        if ($null -ne $s.deferred.PSObject.Properties[$Id]) { $n = [int]$s.deferred.$Id + 1 }
+        $s.deferred | Add-Member -NotePropertyName $Id -NotePropertyValue $n -Force
+        if ($n -ge $Config.DeferEscalateCycles) {
+            Write-OdsLog "ESCALATION: $Id deferred $n consecutive cycles — needs attention." 'ERROR'
+        }
     }
-    Save-OdsMachineState $s
 }
 
 function Write-OdsPending {
@@ -243,10 +246,11 @@ function Forget-OdsProject {
     $cat.entries = @($cat.entries | Where-Object { $_.id -ne $Id })
     if (@($cat.forgotten) -notcontains $Id) { $cat.forgotten = @($cat.forgotten) + $Id }
     Save-OdsCatalog $cat
-    $s = Get-OdsMachineState
-    $s.active = @($s.active | Where-Object { $_ -ne $Id })
-    $s.skip   = @($s.skip   | Where-Object { $_ -ne $Id })
-    Save-OdsMachineState $s
+    Edit-OdsMachineState -Mutate {
+        param($s)
+        $s.active = @($s.active | Where-Object { $_ -ne $Id })
+        $s.skip   = @($s.skip   | Where-Object { $_ -ne $Id })
+    }
     Write-OdsLog "Forgot $Id (tombstoned). OneDrive copy untouched; use -Pull to revive." 'INFO'
 }
 
