@@ -20,7 +20,7 @@
 .PARAMETER Discover   Interactively choose which available projects to sync locally.
 .PARAMETER Conflicts  List unresolved conflict files across active projects.
 .PARAMETER Restore    Restore a project (or --File) from the version archive; optional --At <time>.
-.PARAMETER Diag       Write a diagnostic bundle (logs + config + state, secrets redacted).
+.PARAMETER Diag       Write a diagnostic bundle (logs + config + state) to %TEMP%. NOT redacted — review before sharing.
 .PARAMETER Pause      Disable the scheduled sync task.
 .PARAMETER Resume     Re-enable the scheduled sync task.
 .PARAMETER Gui        Open the management window (delegates to the tray app).
@@ -225,7 +225,8 @@ switch ($true) {
 
     { $Diag } {
         $bundle = Join-Path $env:TEMP ("onedrive-sync-diag-{0}.txt" -f (Get-Date).ToString('yyyyMMdd-HHmmss'))
-        "=== config ==="          | Out-File $bundle
+        "# onedrive-sync diagnostics — NOT redacted; contains full paths, project names and recent log lines. Review before sharing." | Out-File $bundle
+        "=== config ==="          | Out-File $bundle -Append
         ($cfg | ConvertTo-Json)   | Out-File $bundle -Append
         "=== machine-state ==="   | Out-File $bundle -Append
         (Get-OdsMachineState | ConvertTo-Json) | Out-File $bundle -Append
