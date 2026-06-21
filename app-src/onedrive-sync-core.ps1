@@ -146,24 +146,41 @@ function Write-OdsEvent {
 function Enter-OdsLock {
     param([int]$MaxAgeMinutes = 60)
     Initialize-OdsDirs
-    if (Test-Path -LiteralPath $script:OdsLockFile) {
+    # Atomic acquire: File.Open(CreateNew) fails if the lock exists, so two runs
+    # starting together cannot both win (no Test-Path-then-write TOCTOU). A stale
+    # lock (dead pid / too old / unreadable) is broken and the create retried once.
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
         try {
-            $lock = Get-Content -LiteralPath $script:OdsLockFile -Raw | ConvertFrom-Json
-            $alive = $false
-            if ($lock.pid) { $alive = [bool](Get-Process -Id $lock.pid -ErrorAction SilentlyContinue) }
-            $age = (Get-Date) - [datetime]$lock.ts
-            if ($alive -and $age.TotalMinutes -lt $MaxAgeMinutes) {
-                Write-OdsLog "Another run holds the lock (pid $($lock.pid)); exiting." 'WARN'
-                return $false
-            }
-            Write-OdsLog "Breaking stale lock (pid $($lock.pid), age $([int]$age.TotalMinutes)m)." 'WARN'
+            $fs = [System.IO.File]::Open($script:OdsLockFile, [System.IO.FileMode]::CreateNew,
+                                         [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            try {
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes((@{ pid = $PID; ts = (Get-Date).ToString('o') } | ConvertTo-Json -Compress))
+                $fs.Write($bytes, 0, $bytes.Length)
+            } finally { $fs.Close(); $fs.Dispose() }
+            return $true
         } catch {
-            Write-OdsLog "Unreadable lock file; breaking it." 'WARN'
+            $break = $false
+            try {
+                $lock  = Get-Content -LiteralPath $script:OdsLockFile -Raw -ErrorAction Stop | ConvertFrom-Json
+                $alive = $false
+                if ($lock.PSObject.Properties['pid'] -and $lock.pid) { $alive = [bool](Get-Process -Id ([int]$lock.pid) -ErrorAction SilentlyContinue) }
+                $age = if ($lock.PSObject.Properties['ts'] -and $lock.ts) { (Get-Date) - ([datetime]$lock.ts) } else { [timespan]::MaxValue }
+                if ($alive -and $age.TotalMinutes -lt $MaxAgeMinutes) {
+                    Write-OdsLog "Another run holds the lock (pid $($lock.pid)); exiting." 'WARN'
+                    return $false
+                }
+                $pidShown = if ($lock.PSObject.Properties['pid']) { $lock.pid } else { '?' }
+                Write-OdsLog "Breaking stale lock (pid $pidShown, age $([int]$age.TotalMinutes)m)." 'WARN'
+                $break = $true
+            } catch {
+                Write-OdsLog "Unreadable lock file; breaking it." 'WARN'
+                $break = $true
+            }
+            if (-not $break) { return $false }
+            Remove-Item -LiteralPath $script:OdsLockFile -Force -ErrorAction SilentlyContinue
         }
     }
-    @{ pid = $PID; ts = (Get-Date).ToString('o') } | ConvertTo-Json |
-        Set-Content -LiteralPath $script:OdsLockFile -Encoding utf8
-    return $true
+    return $false
 }
 function Exit-OdsLock {
     if (Test-Path -LiteralPath $script:OdsLockFile) {
