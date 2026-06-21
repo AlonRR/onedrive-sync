@@ -86,6 +86,7 @@ function Invoke-OdsRun {
     param([hashtable]$Config, [scriptblock]$Decide, [switch]$DryRun, [switch]$Interactive)
 
     if (-not (Enter-OdsLock)) { return }
+    $emitted = $false
     try {
         Write-OdsEvent 'run-start' @{ dryrun=[bool]$DryRun; interactive=[bool]$Interactive }
         $projects = @(Get-OdsProjects -Config $Config)
@@ -173,8 +174,12 @@ function Invoke-OdsRun {
         $summary = ($results | Group-Object Status | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ' '
         Write-OdsLog "Run complete. $summary" 'INFO'
         Write-OdsEvent 'run-end' @{ summary=$summary; deferred=$deferred.Count }
+        $emitted = $true
         return $results
     } finally {
+        # Always surface a run-end so the tray never hangs on 'Syncing…' if a project
+        # threw mid-run (e.g. rclone.exe missing or a disk error).
+        if (-not $emitted) { try { Write-OdsEvent 'run-end' @{ summary='aborted'; deferred=0; aborted=$true } } catch {} }
         Exit-OdsLock
     }
 }
