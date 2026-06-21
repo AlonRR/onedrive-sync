@@ -355,11 +355,13 @@ function Test-OdsGitIntegrity {
 function Get-OdsConflicts {
     param([object]$Project)
     if (-not (Test-Path -LiteralPath $Project.local)) { return @() }
-    $cn = [regex]::Escape($env:COMPUTERNAME)
     $gitSeg = [IO.Path]::DirectorySeparatorChar + '.git' + [IO.Path]::DirectorySeparatorChar
+    # Match rclone's conflict-suffix ('conflict-<machine>-<yyyyMMddT...>') from ANY
+    # machine, anchored on the 8-digit date stamp so ordinary files ending in
+    # '-COMPUTERNAME.ext' are not mistaken for conflicts.
     @(Get-ChildItem -LiteralPath $Project.local -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -notlike "*$gitSeg*" } |
-        Where-Object { $_.Name -like '*.conflict-*' -or $_.Name -match "-$cn\.[^.]+$" } |
+        Where-Object { $_.Name -match 'conflict-[^\\/]+-\d{8}T' } |
         Select-Object -ExpandProperty FullName -Unique)
 }
 
