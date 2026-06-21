@@ -366,6 +366,28 @@ function Test-OdsOverlap {
             $b.StartsWith($a + '\','OrdinalIgnoreCase'))
 }
 
+function Test-OdsIsProtectedRoot {
+    <#
+      True if $Path is something we must never recursively delete or map a project
+      onto: a drive root, the user profile, the OneDrive root, or an ANCESTOR of any
+      of those. Fails closed — an unparseable/empty path is treated as protected.
+    #>
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $true }
+    $full = try { [IO.Path]::GetFullPath($Path).TrimEnd('\') } catch { return $true }
+    if ([string]::IsNullOrWhiteSpace($full)) { return $true }
+    if ([string]::IsNullOrEmpty([IO.Path]::GetDirectoryName($full))) { return $true }   # drive root
+    $roots = @($env:USERPROFILE, $env:PUBLIC, $env:ProgramData, $env:windir)
+    try { $roots += (Get-OdsOneDriveRoot) } catch {}
+    foreach ($r in $roots) {
+        if ([string]::IsNullOrWhiteSpace($r)) { continue }
+        $rf = try { [IO.Path]::GetFullPath($r).TrimEnd('\') } catch { continue }
+        if ($full.Equals($rf, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        if ($rf.StartsWith($full + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
 #endregion
 
 . (Join-Path $PSScriptRoot 'onedrive-sync-core.discovery.ps1')

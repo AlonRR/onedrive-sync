@@ -234,6 +234,9 @@ function Unmap-OdsProject {
     Set-OdsState -Id $Id -Status skip
     Reset-OdsBaseline -Id $Id
     if ($DeleteLocal -and $proj -and (Test-Path -LiteralPath $proj.local)) {
+        if (Test-OdsIsProtectedRoot $proj.local) {
+            throw "Refusing -DeleteLocal for '$Id': '$($proj.local)' is (or contains) a protected root."
+        }
         Remove-Item -LiteralPath $proj.local -Recurse -Force
         Write-OdsLog "Removed local copy of $Id (OneDrive copy preserved)." 'INFO'
     }
@@ -258,10 +261,13 @@ function Add-OdsWatchMapping {
     <# Persist a new watch entry (arbitrary dest chosen by the user). #>
     param([string]$Local, [string]$Dest, [hashtable]$Config)
     $od = Get-OdsOneDriveRoot; $up = $env:USERPROFILE.TrimEnd('\')
+    # IsNullOrEmpty: Get-OdsRelUnder returns '' (not $null) when the folder IS the root,
+    # which must also be refused or a project would map onto the whole root tree.
     $destRel = Get-OdsRelUnder -Full $Dest -Root $od
-    if ($null -eq $destRel) { throw "Destination must be under OneDrive ($od)." }
+    if ([string]::IsNullOrEmpty($destRel)) { throw "Destination must be a folder UNDER OneDrive ($od)." }
     $localRel = Get-OdsRelUnder -Full $Local -Root $up
-    if ($null -eq $localRel) { throw "Local folder must be under $up." }
+    if ([string]::IsNullOrEmpty($localRel)) { throw "Local folder must be a folder UNDER your profile ($up)." }
+    if ((Test-OdsIsProtectedRoot $Local) -or (Test-OdsIsProtectedRoot $Dest)) { throw "Local or Dest is a protected root — refused." }
     if (Test-OdsOverlap $Local $Dest) { throw "Local and Dest overlap — refused (would self-sync)." }
     $cat = Get-OdsCatalog
     $cat.entries = @($cat.entries | Where-Object { $_.id -ne $destRel }) + [pscustomobject]@{
