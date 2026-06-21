@@ -214,8 +214,26 @@ function Write-OdsJson {
     # Use -InputObject to avoid PS 5.1 pipeline-unwrapping empty arrays to no output.
     $json = ConvertTo-Json -InputObject $Object -Depth 8 -ErrorAction SilentlyContinue
     if ([string]::IsNullOrEmpty($json)) { $json = if ($null -eq $Object) { 'null' } elseif ($Object -is [array]) { '[]' } else { '{}' } }
-    [System.IO.File]::WriteAllText($tmp, $json, [System.Text.Utf8Encoding]::new($false))
-    Move-Item -LiteralPath $tmp -Destination $Path -Force
+    try {
+        [System.IO.File]::WriteAllText($tmp, $json, [System.Text.Utf8Encoding]::new($false))
+        if (Test-Path -LiteralPath $Path) {
+            [System.IO.File]::Replace($tmp, $Path, $null)   # atomic in-place replace (no delete+rename gap)
+        } else {
+            [System.IO.File]::Move($tmp, $Path)             # atomic create
+        }
+    } catch {
+        Move-Item -LiteralPath $tmp -Destination $Path -Force   # best-effort fallback
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
+    # Sweep orphaned temps left by crashed / force-killed writers (older than 2 min,
+    # so a concurrent writer's in-flight temp is never touched).
+    try {
+        $leaf = Split-Path -Leaf $Path
+        $cut = (Get-Date).AddMinutes(-2)
+        Get-ChildItem -LiteralPath $dir -Filter "$leaf.tmp.*" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $cut } | Remove-Item -Force -ErrorAction SilentlyContinue
+    } catch {}
 }
 
 #endregion
