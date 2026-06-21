@@ -805,7 +805,9 @@ $MainXaml = @'
 
 function Show-OdsWindow {
     if ($null -ne $script:MainWin) {
-        $script:MainWin.Show()
+        # The window is shown modally (ShowDialog) and only Hidden on close, so the
+        # modal loop is still live — calling .Show() again throws. Re-reveal via Visibility.
+        $script:MainWin.Visibility  = [System.Windows.Visibility]::Visible
         $script:MainWin.WindowState = [System.Windows.WindowState]::Normal
         $script:MainWin.Activate()
         return
