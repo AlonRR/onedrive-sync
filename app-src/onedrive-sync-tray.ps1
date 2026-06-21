@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     OneDrive 2-way sync - system-tray helper + WPF management window.
 
@@ -71,7 +71,13 @@ $CliPath = Join-Path $PSScriptRoot 'onedrive-sync.ps1'
 
 function Invoke-Cli {
     param([string[]]$CliArgs)
-    Start-Process $AppPwsh.Source -ArgumentList (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$CliPath`"", '-NoUpdate') + $CliArgs) -WindowStyle Hidden
+    # Build ONE properly-quoted command line: a project id/path with a space
+    # (e.g. '3D printing\...') must reach the CLI as a single argument, not be split.
+    $tokens = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $CliPath, '-NoUpdate') + $CliArgs
+    $line = ($tokens | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+    }) -join ' '
+    Start-Process -FilePath $AppPwsh.Source -ArgumentList $line -WindowStyle Hidden
 }
 
 function New-WpfWindow {
