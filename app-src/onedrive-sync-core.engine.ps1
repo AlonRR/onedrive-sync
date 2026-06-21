@@ -411,15 +411,26 @@ function Invoke-OdsVersionPrune {
     param([hashtable]$Config)
     if (-not (Test-Path -LiteralPath $script:OdsVersionsDir)) { return }
     $cut = (Get-Date).AddDays(-$Config.VersionRetentionDays)
+    $projDirs = @(Get-ChildItem -LiteralPath $script:OdsVersionsDir -Directory -ErrorAction SilentlyContinue)
+    # Never prune a project's NEWEST run, so a project that hasn't synced in a while
+    # always keeps at least one restore point (age-based and size-cap both honor this).
+    $keep = @{}
+    foreach ($d in $projDirs) {
+        $n = @(Get-ChildItem -LiteralPath $d.FullName -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+        if ($n.Count) { $keep[$n[0].FullName] = $true }
+    }
     # age-based
-    foreach ($d in (Get-ChildItem -LiteralPath $script:OdsVersionsDir -Directory -ErrorAction SilentlyContinue)) {
+    foreach ($d in $projDirs) {
         foreach ($run in (Get-ChildItem -LiteralPath $d.FullName -Directory -ErrorAction SilentlyContinue)) {
-            if ($run.LastWriteTime -lt $cut) { Remove-Item -LiteralPath $run.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+            if ($run.LastWriteTime -lt $cut -and -not $keep.ContainsKey($run.FullName)) {
+                Remove-Item -LiteralPath $run.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     }
-    # size-cap (oldest first)
-    $allRuns = Get-ChildItem -LiteralPath $script:OdsVersionsDir -Directory -ErrorAction SilentlyContinue |
+    # size-cap (oldest first), still never deleting a project's newest run
+    $allRuns = $projDirs |
                ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Directory -ErrorAction SilentlyContinue } |
+               Where-Object { -not $keep.ContainsKey($_.FullName) } |
                Sort-Object LastWriteTime
     $maxBytes = [int64]$Config.VersionMaxGB * 1GB
     $total = ($allRuns | ForEach-Object { (Get-ChildItem -LiteralPath $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum } | Measure-Object -Sum).Sum
