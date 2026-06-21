@@ -245,7 +245,10 @@ function Merge-OdsCatalog {
 # ============================================================================
 
 function Get-OdsMachineState {
-    $s = Read-OdsJson -Path $script:OdsMachineState -Default ([pscustomobject]@{ active=@(); skip=@(); compare=@{}; deferred=@{} })
+    # compare/deferred/maxDelete must be PSCustomObject, not @{}: on a fresh machine the
+    # Default is returned verbatim and an @{} hashtable silently drops Add-Member
+    # NotePropertyName writes (the first per-project setting set).
+    $s = Read-OdsJson -Path $script:OdsMachineState -Default ([pscustomobject]@{ active=@(); skip=@(); compare=[pscustomobject]@{}; deferred=[pscustomobject]@{} })
     foreach ($p in 'active','skip') { if ($null -eq $s.PSObject.Properties[$p]) { $s | Add-Member $p @() -Force } }
     foreach ($p in 'compare','deferred','maxDelete') { if ($null -eq $s.PSObject.Properties[$p]) { $s | Add-Member $p ([pscustomobject]@{}) -Force } }
     return $s
