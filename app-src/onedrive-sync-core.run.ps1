@@ -376,12 +376,32 @@ function Update-OdsAppFromSource {
     if ($trayProcs) { $trayProcs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }
     if ($hadTray) { Start-Sleep -Milliseconds 500 }
 
-    # Stage all updated files.
-    if (-not (Test-Path -LiteralPath $script:OdsAppDir)) { New-Item -ItemType Directory -Path $script:OdsAppDir -Force | Out-Null }
-    Get-ChildItem -LiteralPath $srcDir -File | ForEach-Object {
-        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $script:OdsAppDir $_.Name) -Force
+    # Stage to a temp dir and PARSE-VALIDATE before touching the live app dir, so a
+    # partial/corrupt copy can never leave an unparseable app. VERSION is written LAST,
+    # so a crash mid-copy leaves the old VERSION and the next run simply retries.
+    $stage = Join-Path $script:OdsLocalRoot ('app.stage.' + $PID)
+    if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
+    try {
+        Get-ChildItem -LiteralPath $srcDir -File | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $stage $_.Name) -Force
+        }
+        foreach ($ps in (Get-ChildItem -LiteralPath $stage -Filter '*.ps1' -File)) {
+            $perr = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($ps.FullName, [ref]$null, [ref]$perr)
+            if ($perr) { throw "Staged update file '$($ps.Name)' failed to parse; aborting update." }
+        }
+        if (-not (Test-Path -LiteralPath $script:OdsAppDir)) { New-Item -ItemType Directory -Path $script:OdsAppDir -Force | Out-Null }
+        $staged = @(Get-ChildItem -LiteralPath $stage -File)
+        foreach ($f in ($staged | Where-Object { $_.Name -ne 'VERSION' })) {
+            Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $script:OdsAppDir $f.Name) -Force
+        }
+        $vf = $staged | Where-Object { $_.Name -eq 'VERSION' } | Select-Object -First 1
+        if ($vf) { Copy-Item -LiteralPath $vf.FullName -Destination (Join-Path $script:OdsAppDir 'VERSION') -Force }
+        Write-OdsLog "Staged tool update $localVer -> $srcVer." 'INFO'
+    } finally {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
     }
-    Write-OdsLog "Staged tool update $localVer -> $srcVer." 'INFO'
 
     # Restart the tray if it was running.
     if ($hadTray) {
