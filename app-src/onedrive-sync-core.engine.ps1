@@ -357,9 +357,15 @@ function Resolve-OdsDivergence {
     if (-not $refConf) { return } # no divergence surfaced
 
     Write-OdsLog "Divergence detected on $($Project.id) branch '$branch'; reconciling via git." 'WARN'
-    # Fetch the OneDrive copy as a remote and merge.
+    # A failed/partial fetch must NOT fall through to a merge against a stale/absent
+    # FETCH_HEAD — leave the conflict copies for manual resolution instead.
     $tmpRemote = $Project.dest
-    Invoke-OdsGit -RepoDir $Project.local -GitArgs @('fetch', $tmpRemote, $branch) | Out-Null
+    $fetch = Invoke-OdsGit -RepoDir $Project.local -GitArgs @('fetch', $tmpRemote, $branch)
+    if ($fetch.Code -ne 0) {
+        Write-OdsLog "Divergence reconcile aborted on $($Project.id): git fetch from dest failed (code $($fetch.Code))." 'ERROR'
+        Write-OdsEvent 'divergence' @{ id=$Project.id; result='fetch-failed'; code=$fetch.Code }
+        return
+    }
     $merge = Invoke-OdsGit -RepoDir $Project.local -GitArgs @('merge','--no-edit','FETCH_HEAD')
     if ($merge.Code -ne 0) {
         $tag = "ods-orphan-$((Get-Date).ToString('yyyyMMddHHmmss'))"
