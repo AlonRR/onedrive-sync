@@ -169,7 +169,7 @@ function Invoke-OdsRun {
             }
         }
 
-        Invoke-OdsVersionPrune -Config $Config
+        if (-not $DryRun) { Invoke-OdsVersionPrune -Config $Config }   # prune deletes from the restore archive
         $summary = ($results | Group-Object Status | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ' '
         Write-OdsLog "Run complete. $summary" 'INFO'
         Write-OdsEvent 'run-end' @{ summary=$summary; deferred=$deferred.Count }
