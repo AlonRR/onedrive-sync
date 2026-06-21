@@ -947,7 +947,7 @@ function Show-OdsWindow {
         $allProjects = @(Get-OdsProjects -Config (Get-Cfg))
         foreach ($id in $ids) {
             $p = $allProjects | Where-Object id -eq $id | Select-Object -First 1
-            if ($p -and (Test-Path $p.local)) { Start-Process explorer.exe $p.local }
+            if ($p -and (Test-Path -LiteralPath $p.local)) { Start-Process explorer.exe -ArgumentList "`"$($p.local)`"" }
         }
     })
     $btnUnmap.Add_Click({
