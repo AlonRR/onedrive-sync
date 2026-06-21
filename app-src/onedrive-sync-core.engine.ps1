@@ -272,8 +272,11 @@ function Invoke-OdsBisync {
     $compareState = $machState.compare
     $mode = if ($null -ne $compareState.PSObject.Properties[$Project.id]) { $compareState.$($Project.id) } else { $Config.CompareMode }
     $compare = if ($mode -eq 'checksum') { 'size,checksum' } else { 'size,modtime' }
-    $mdState   = $machState.maxDelete
-    $maxDelete = if ($null -ne $mdState.PSObject.Properties[$Project.id]) { [int]$mdState.$($Project.id) } else { $Config.MaxDeletePercent }
+    $mdState  = $machState.maxDelete
+    $override = if ($null -ne $mdState.PSObject.Properties[$Project.id]) { [int]$mdState.$($Project.id) } else { $null }
+    # -ApproveDeletes raises the config limit to 100 for this run and must win over a
+    # persistent per-project override; otherwise the per-project override wins.
+    $maxDelete = if ([int]$Config.MaxDeletePercent -ge 100) { 100 } elseif ($null -ne $override) { $override } else { [int]$Config.MaxDeletePercent }
 
     if (-not (Test-Path -LiteralPath $Project.local)) { New-Item -ItemType Directory -Path $Project.local -Force | Out-Null }
     if (-not (Test-Path -LiteralPath $Project.dest))  { New-Item -ItemType Directory -Path $Project.dest  -Force | Out-Null }
