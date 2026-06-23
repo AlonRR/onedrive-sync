@@ -61,6 +61,7 @@ $script:CachedRows     = $null   # [object[]] populated by background runspace; 
 $script:RefreshHandle  = $null   # { PS, Async, RS } active background status job
 $script:LastRunEndTs   = $null   # ISO timestamp of last run-end event seen; '' = none today; null = not yet checked
 $script:SyncStartedAt  = $null   # [datetime] when a manual sync was started; $null = idle
+$script:AttentionIds   = @()     # ids whose last real bisync did not succeed (code != 0); drives the red icon + alert balloon
 $script:IconIsOwned    = $false  # $true when current tray icon was drawn by New-StatusIcon (has owned HICON)
 $script:LastIconColor  = $null   # last color passed to New-StatusIcon; skip GDI alloc on no-change
 $script:StartedAt             = [datetime]::Now  # startup time for stale-grace-period on fresh install
@@ -165,6 +166,21 @@ function Get-OdsLastRunEndEvent {
         Sort-Object { [string]$_.ts } | Select-Object -Last 1
 }
 
+function Get-OdsAttentionSet {
+    # Ids of projects whose MOST-RECENT real (non-dry-run) bisync did not succeed
+    # (rclone exit != 0: delete-brake held, a filter/baseline needing --resync, or a
+    # hard error). Events are read oldest->newest so the last code per id wins. Purely
+    # tray-side - reads the event log the tray already caches, no engine involvement.
+    $byId = [ordered]@{}
+    foreach ($e in (Get-OdsRecentEvents | Where-Object { $_.event -eq 'bisync' })) {
+        if ($e.PSObject.Properties['dryrun'] -and $e.dryrun) { continue }
+        if ($e.PSObject.Properties['id'] -and $e.PSObject.Properties['code']) {
+            $byId[[string]$e.id] = [int]$e.code
+        }
+    }
+    @($byId.Keys | Where-Object { $byId[$_] -ne 0 })
+}
+
 function Get-LastSyncText {
     try {
         $last = Get-OdsLastRunEndEvent
@@ -203,8 +219,10 @@ function Update-TrayIcon {
     $conflicts = [int](($rows | Measure-Object -Property Conflicts -Sum).Sum)
     $active    = @($rows | Where-Object { $_.Status -eq 'active' }).Count
 
-    # Icon color priority: conflicts > syncing > stale > ok > no-projects
-    $color = if ($conflicts -gt 0) {
+    # Icon color priority: needs-attention > conflicts > syncing > stale > ok > none
+    $color = if ($script:AttentionIds.Count -gt 0) {
+        'Red'
+    } elseif ($conflicts -gt 0) {
         'Crimson'
     } elseif ($null -ne $script:SyncStartedAt) {
         'SteelBlue'
@@ -233,6 +251,7 @@ function Update-TrayIcon {
     }
 
     $parts = @('OneDrive Sync')
+    if ($script:AttentionIds.Count -gt 0) { $parts += "$($script:AttentionIds.Count) need attention" }
     if ($conflicts -gt 0) { $parts += "$conflicts conflict(s)" }
     if ($null -ne $script:SyncStartedAt) {
         $elapsed = [int]([datetime]::Now - $script:SyncStartedAt).TotalMinutes
@@ -769,6 +788,7 @@ $MainXaml = @'
         <Button x:Name="btnForget"     Content="Retire"       Background="#C50F1F" Style="{StaticResource Btn}"/>
         <Rectangle Width="1" Fill="#E0E0E0" Margin="6,3"/>
         <Button x:Name="btnConflicts"  Content="Conflicts"    Background="#5C5C5C" Style="{StaticResource Btn}"/>
+        <Button x:Name="btnResync"     Content="Resync"       Background="#8A6D00" Style="{StaticResource Btn}"/>
         <Button x:Name="btnWatch"      Content="Watch..."     Background="#107C10" Style="{StaticResource Btn}"/>
         <Button x:Name="btnDiscover"   Content="Discover New" Background="#107C10" Style="{StaticResource Btn}"/>
         <Button x:Name="btnRetired"    Content="Show Retired" Background="#5C5C5C" Style="{StaticResource Btn}"/>
@@ -924,6 +944,7 @@ function Show-OdsWindow {
     $btnUnmap      = $win.FindName('btnUnmap')
     $btnForget     = $win.FindName('btnForget')
     $btnConflicts  = $win.FindName('btnConflicts')
+    $btnResync     = $win.FindName('btnResync')
     $btnWatch      = $win.FindName('btnWatch')
     $btnDiscover   = $win.FindName('btnDiscover')
     $btnRetired    = $win.FindName('btnRetired')
@@ -960,6 +981,7 @@ function Show-OdsWindow {
         $btnOpenFolder.IsEnabled   = $n -gt 0
         $btnUnmap.IsEnabled        = $n -gt 0
         $btnForget.IsEnabled       = $n -gt 0
+        $btnResync.IsEnabled       = $n -gt 0
         $btnProjSettings.IsEnabled = $n -eq 1
     }
     Update-ButtonStates
@@ -1005,6 +1027,15 @@ function Show-OdsWindow {
         }
     })
     $btnConflicts.Add_Click({ Invoke-Cli @('-Conflicts') })
+    $btnResync.Add_Click({
+        $ids = Get-SelectedIds
+        if (-not $ids) { Set-WinStatus 'Select one or more projects to resync.' ([System.Windows.Media.Brushes]::Crimson); return }
+        if (Confirm-Action "Resync $($ids.Count) project(s)?`n`nThis re-establishes the bisync baseline (newer side wins, nothing is deleted). Use it to recover a project that won't sync - e.g. 'filters file has changed' or a stuck delete-brake.") {
+            foreach ($id in $ids) { Invoke-Cli @('-Resync', $id) }
+            Set-WinStatus 'Resync started; refreshing shortly...'
+            Refresh-Data -Force
+        }
+    })
     $btnWatch.Add_Click({ Show-OdsWatch; Refresh-Data -Force })
     $btnDiscover.Add_Click({ Show-OdsPicker; Refresh-Data -Force })
     $btnRetired.Add_Click({ Show-OdsRetired; Refresh-Data -Force })
@@ -1483,18 +1514,31 @@ $timer.Add_Tick({
         }
         # Start next background refresh if idle
         Start-StatusRefresh
-        # Detect new run-end events - sync-complete balloon + clear syncing indicator
+        # Detect new run-end events - alert / sync-complete balloon + clear syncing indicator
         try {
             $lastRun = Get-OdsLastRunEndEvent
             if ($lastRun -and [string]$lastRun.ts -ne [string]$script:LastRunEndTs) {
                 $script:LastRunEndTs  = $lastRun.ts
                 $script:SyncStartedAt = $null
+                # Recompute the needs-attention set from this run; alert only on projects
+                # that NEWLY failed, so a persistent issue doesn't nag on every run.
+                $att     = @(Get-OdsAttentionSet)
+                $newOnes = @($att | Where-Object { $script:AttentionIds -notcontains $_ })
+                $script:AttentionIds = $att
                 Update-TrayIcon
-                $summary = if ($lastRun.PSObject.Properties['summary'] -and $lastRun.summary) { $lastRun.summary } else { 'done' }
-                $icon.BalloonTipTitle = 'OneDrive Sync'
-                $icon.BalloonTipText  = "Sync complete - $summary"
-                $icon.BalloonTipIcon  = 'Info'
-                $icon.ShowBalloonTip(5000)
+                if ($newOnes.Count -gt 0) {
+                    $names = ($newOnes | ForEach-Object { ($_ -split '\\')[-1] }) -join ', '
+                    $icon.BalloonTipTitle = 'OneDrive Sync - needs attention'
+                    $icon.BalloonTipText  = "$($newOnes.Count) project(s) did not sync: $names. Click to open and Resync."
+                    $icon.BalloonTipIcon  = 'Warning'
+                    $icon.ShowBalloonTip(7000)
+                } else {
+                    $summary = if ($lastRun.PSObject.Properties['summary'] -and $lastRun.summary) { $lastRun.summary } else { 'done' }
+                    $icon.BalloonTipTitle = 'OneDrive Sync'
+                    $icon.BalloonTipText  = "Sync complete - $summary"
+                    $icon.BalloonTipIcon  = 'Info'
+                    $icon.ShowBalloonTip(5000)
+                }
             }
         } catch {}
         # Clear stale syncing indicator if no run-end arrived within 30 minutes
@@ -1526,7 +1570,11 @@ try {
     $seed = Get-OdsLastRunEndEvent
     $script:LastRunEndTs = if ($seed) { $seed.ts } else { '' }
 } catch { $script:LastRunEndTs = '' }
-$icon.Add_BalloonTipClicked({ Show-OdsPicker })
+$icon.Add_BalloonTipClicked({
+    # Route to where the user can act: the management window (with Resync) if something
+    # needs attention, otherwise the new-projects picker.
+    if ($script:AttentionIds.Count -gt 0) { try { Show-OdsWindow } catch {} } else { Show-OdsPicker }
+})
 
 # Poll the show-window signal on the UI thread; a second launch sets it (see top).
 $script:OdsShowTimer = New-Object System.Windows.Forms.Timer
