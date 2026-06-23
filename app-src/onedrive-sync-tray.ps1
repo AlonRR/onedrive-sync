@@ -1036,20 +1036,32 @@ function Show-OdsWindow {
             Refresh-Data -Force
         }
     })
-    $btnWatch.Add_Click({ Show-OdsWatch; Refresh-Data -Force })
-    $btnDiscover.Add_Click({ Show-OdsPicker; Refresh-Data -Force })
-    $btnRetired.Add_Click({ Show-OdsRetired; Refresh-Data -Force })
+    # Opening a sub-window must never crash the tray: ShowDialog is called synchronously
+    # here, so a failure in the sub-window's build or interaction unwinds into these
+    # handlers. Guard each, surface the message in the status bar, and log it.
+    $btnWatch.Add_Click({ try { Show-OdsWatch; Refresh-Data -Force } catch { Set-WinStatus "Watch failed: $($_.Exception.Message)" ([System.Windows.Media.Brushes]::Crimson); try { Write-OdsLog "Tray: Watch window failed: $($_.Exception.Message)" 'ERROR' } catch {} } })
+    $btnDiscover.Add_Click({ try { Show-OdsPicker; Refresh-Data -Force } catch { Set-WinStatus "Discover failed: $($_.Exception.Message)" ([System.Windows.Media.Brushes]::Crimson); try { Write-OdsLog "Tray: Discover window failed: $($_.Exception.Message)" 'ERROR' } catch {} } })
+    $btnRetired.Add_Click({ try { Show-OdsRetired; Refresh-Data -Force } catch { Set-WinStatus "Show Retired failed: $($_.Exception.Message)" ([System.Windows.Media.Brushes]::Crimson); try { Write-OdsLog "Tray: Retired window failed: $($_.Exception.Message)" 'ERROR' } catch {} } })
     $btnRefresh.Add_Click({ Refresh-Data -Force })
-    $btnSettings.Add_Click({ Show-OdsSettings; $script:Cfg = $null; Refresh-Data -Force })
+    $btnSettings.Add_Click({ try { Show-OdsSettings; $script:Cfg = $null; Refresh-Data -Force } catch { Set-WinStatus "Settings failed: $($_.Exception.Message)" ([System.Windows.Media.Brushes]::Crimson); try { Write-OdsLog "Tray: Settings window failed: $($_.Exception.Message)" 'ERROR' } catch {} } })
     $btnProjSettings.Add_Click({
         $ids = @(Get-SelectedIds)
         if ($ids.Count -ne 1) { Set-WinStatus 'Select exactly one project.' ([System.Windows.Media.Brushes]::Crimson); return }
-        Show-OdsProjectSettings -ProjectId $ids[0]
-        Refresh-Data -Force
+        try { Show-OdsProjectSettings -ProjectId $ids[0]; Refresh-Data -Force }
+        catch {
+            Set-WinStatus "Project Settings error: $($_.Exception.Message)" ([System.Windows.Media.Brushes]::Crimson)
+            try { Write-OdsLog "Tray: Project Settings failed for '$($ids[0])': $($_.Exception.Message)" 'ERROR' } catch {}
+        }
     })
     $grid.Add_MouseDoubleClick({
         $ids = @(Get-SelectedIds)
-        if ($ids.Count -eq 1) { Show-OdsProjectSettings -ProjectId $ids[0]; Refresh-Data -Force }
+        if ($ids.Count -eq 1) {
+            try { Show-OdsProjectSettings -ProjectId $ids[0]; Refresh-Data -Force }
+            catch {
+                Set-WinStatus "Project Settings error: $($_.Exception.Message)" ([System.Windows.Media.Brushes]::Crimson)
+                try { Write-OdsLog "Tray: Project Settings failed for '$($ids[0])': $($_.Exception.Message)" 'ERROR' } catch {}
+            }
+        }
     })
 
     # Register the refresh callback so the timer tick can push completed background
