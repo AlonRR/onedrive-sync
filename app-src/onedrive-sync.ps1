@@ -174,14 +174,14 @@ switch ($true) {
 
     { $Discover } {
         Resolve-OdsNewWatchProjects -Config $cfg
-        Invoke-OdsRun -Config $cfg -Interactive -Decide { param($u) Invoke-OdsConsolePicker -Undecided $u } | Out-Null
+        Invoke-OdsRun -Config $cfg -Interactive -IgnorePause -Decide { param($u) Invoke-OdsConsolePicker -Undecided $u } | Out-Null
         break
     }
 
     { $PSBoundParameters.ContainsKey('SyncNow') } {
         if (-not $SyncNow -or $SyncNow -eq '*') {
             $cfg2 = $cfg.Clone(); if ($ApproveDeletes) { $cfg2.MaxDeletePercent = 100 }
-            Invoke-OdsRun -Config $cfg2 | Out-Null
+            Invoke-OdsRun -Config $cfg2 -IgnorePause | Out-Null
         } else {
             $rid  = Resolve-OdsId $SyncNow $cfg
             $proj = @(Get-OdsProjects -Config $cfg) | Where-Object { $_.id -eq $rid } | Select-Object -First 1
@@ -236,8 +236,24 @@ switch ($true) {
         break
     }
 
-    { $Pause }  { Disable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null; Write-Host "Scheduled sync paused." -ForegroundColor Yellow; break }
-    { $Resume } { Enable-ScheduledTask  -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null; Write-Host "Scheduled sync resumed." -ForegroundColor Green; break }
+    { $Pause }  {
+        # A flag file is the authoritative pause gate (Invoke-OdsRun skips when present):
+        # it never needs elevation, unlike Disable-ScheduledTask which can be access-
+        # denied. Also try to disable the task so it does not even spawn, but treat that
+        # as a best-effort optimization — the flag is what actually pauses syncing.
+        $flag = Join-Path $env:LOCALAPPDATA 'onedrive-sync\paused.flag'
+        Set-Content -LiteralPath $flag -Value (Get-Date -Format o) -Encoding ascii
+        try { Disable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null } catch {}
+        Write-Host "Scheduled sync paused (runs skip until -Resume)." -ForegroundColor Yellow
+        break
+    }
+    { $Resume } {
+        $flag = Join-Path $env:LOCALAPPDATA 'onedrive-sync\paused.flag'
+        Remove-Item -LiteralPath $flag -Force -ErrorAction SilentlyContinue
+        try { Enable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null } catch {}
+        Write-Host "Scheduled sync resumed." -ForegroundColor Green
+        break
+    }
 
     { $Gui } {
         $tray = Join-Path $PSScriptRoot 'onedrive-sync-tray.ps1'

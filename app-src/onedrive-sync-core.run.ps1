@@ -83,7 +83,15 @@ function Invoke-OdsRun {
       list of undecided projects and returns the ids to activate (interactive).
       With no -Decide, undecided projects are written to pending.json (background).
     #>
-    param([hashtable]$Config, [scriptblock]$Decide, [switch]$DryRun, [switch]$Interactive)
+    param([hashtable]$Config, [scriptblock]$Decide, [switch]$DryRun, [switch]$Interactive, [switch]$IgnorePause)
+
+    # Pause gate: -Pause drops a flag file (an elevation-free, reliable alternative to
+    # Disable-ScheduledTask). The scheduled/default run honors it; explicit user actions
+    # (-SyncNow *, -Discover) pass -IgnorePause so they still work while paused.
+    if (-not $IgnorePause -and (Test-Path -LiteralPath (Join-Path $script:OdsLocalRoot 'paused.flag'))) {
+        Write-OdsLog 'Sync paused (paused.flag present); skipping run.' 'INFO'
+        return
+    }
 
     if (-not (Enter-OdsLock)) { return }
     $emitted = $false
