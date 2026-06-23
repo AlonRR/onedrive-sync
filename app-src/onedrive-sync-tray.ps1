@@ -929,6 +929,19 @@ function Refresh-Data {
     $script:winLblCounts.Text = "$active active" + $(if ($conflicts -gt 0) { ' | ' + $conflicts + ' conflict(s)' } else { '' })
 }
 
+function Update-OdsButtonStates {
+    # Script scope (not nested in Show-OdsWindow): the grid's SelectionChanged fires
+    # while the script-scope Refresh-Data is mutating the grid, a context where a nested
+    # function is unresolvable ("Update-ButtonStates is not recognized"). Resolve the
+    # buttons from the live window so it works from any dispatch scope.
+    if ($null -eq $script:MainWin -or $null -eq $script:winGrid) { return }
+    $n = $script:winGrid.SelectedItems.Count
+    foreach ($name in 'btnPull','btnOpenFolder','btnUnmap','btnForget','btnResync') {
+        $b = $script:MainWin.FindName($name); if ($b) { $b.IsEnabled = $n -gt 0 }
+    }
+    $bp = $script:MainWin.FindName('btnProjSettings'); if ($bp) { $bp.IsEnabled = $n -eq 1 }
+}
+
 function Show-OdsWindow {
     if ($null -ne $script:MainWin) {
         # The window is shown modally (ShowDialog) and only Hidden on close, so the
@@ -980,17 +993,8 @@ function Show-OdsWindow {
         $lblLastSync.Foreground = if ($null -eq $Brush) { $idleTextBrush } else { $Brush }
         $lblLastSync.Text = $Msg
     }
-    function Update-ButtonStates {
-        $n = $grid.SelectedItems.Count
-        $btnPull.IsEnabled         = $n -gt 0
-        $btnOpenFolder.IsEnabled   = $n -gt 0
-        $btnUnmap.IsEnabled        = $n -gt 0
-        $btnForget.IsEnabled       = $n -gt 0
-        $btnResync.IsEnabled       = $n -gt 0
-        $btnProjSettings.IsEnabled = $n -eq 1
-    }
-    Update-ButtonStates
-    $grid.Add_SelectionChanged({ Update-ButtonStates })
+    Update-OdsButtonStates
+    $grid.Add_SelectionChanged({ Update-OdsButtonStates })
 
     $btnSyncNow.Add_Click({
         $ids = Get-SelectedIds
