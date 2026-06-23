@@ -153,6 +153,10 @@ function Resolve-OdsId {
 }
 
 # ============================ Dispatch =======================================
+# A library action (e.g. Pull/Restore on a non-existent id) throws by design; the
+# CLI must surface that as a clean one-line message and a non-zero exit, not a raw
+# PowerShell stack trace. This top-level catch keeps every option failing gracefully.
+try {
 switch ($true) {
 
     { $List } {
@@ -265,4 +269,8 @@ switch ($true) {
         # Normal run (background semantics: no popups; pending.json + tray surface decisions).
         Invoke-OdsRun -Config $cfg -DryRun:$DryRun | Out-Null
     }
+}
+} catch {
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    exit 1
 }
