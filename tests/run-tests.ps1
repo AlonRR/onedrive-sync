@@ -30,11 +30,22 @@ function New-TestRepo {
     param([string]$Path, [hashtable]$Files=@{}, [string[]]$Gitignore=@(), [string[]]$Track=@())
     New-Item -ItemType Directory -Force $Path | Out-Null
     Push-Location $Path
-    git init -q; git config user.email t@t.t; git config user.name t
-    if ($Gitignore) { Set-Content .gitignore ($Gitignore -join "`n") }
-    foreach ($k in $Files.Keys) { $f = Join-Path $Path $k; New-Item -ItemType Directory -Force (Split-Path $f) | Out-Null; Set-Content $f $Files[$k] }
-    if ($Track) { git add -f @Track 2>$null; git commit -qm init 2>$null | Out-Null }
-    Pop-Location
+    # git writes benign warnings (e.g. "LF will be replaced by CRLF") to stderr; under
+    # $ErrorActionPreference='Stop' on Windows PowerShell 5.1 that becomes a terminating
+    # NativeCommandError even with 2>$null. Pin Continue and force autocrlf off so the
+    # temp repos behave identically regardless of the host's global git config.
+    $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        git init -q
+        git config user.email t@t.t; git config user.name t
+        git config core.autocrlf false; git config core.safecrlf false
+        if ($Gitignore) { Set-Content .gitignore ($Gitignore -join "`n") }
+        foreach ($k in $Files.Keys) { $f = Join-Path $Path $k; New-Item -ItemType Directory -Force (Split-Path $f) | Out-Null; Set-Content $f $Files[$k] }
+        if ($Track) { git add -f @Track 2>$null; git commit -qm init 2>$null | Out-Null }
+    } finally {
+        $ErrorActionPreference = $prevEAP
+        Pop-Location
+    }
 }
 
 try {
