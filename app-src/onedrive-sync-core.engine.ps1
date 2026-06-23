@@ -18,15 +18,20 @@ function Get-OdsGit {
     throw "git not found on PATH. Run install-task.ps1."
 }
 function Invoke-OdsGit {
-    param([string]$RepoDir, [string[]]$GitArgs)
+    param([string]$RepoDir, [string[]]$GitArgs, [switch]$CaptureStderr)
     $git = Get-OdsGit
     # A git warning/error on stderr (e.g. a repo with a dangling origin/HEAD) must NOT
     # abort the run: under Windows PowerShell 5.1 with $ErrorActionPreference='Stop',
     # native stderr becomes a terminating NativeCommandError even with 2>$null. Force
-    # Continue for this call and judge success by the exit code only.
+    # Continue for this call and judge success by the exit code only. -CaptureStderr
+    # merges stderr into Output (2>&1) for callers that must inspect git's messages
+    # (e.g. fsck, whose findings go to stderr); the default discards it (2>$null).
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    try { $out = & $git -C $RepoDir @GitArgs 2>$null }
+    try {
+        if ($CaptureStderr) { $out = & $git -C $RepoDir @GitArgs 2>&1 }
+        else                { $out = & $git -C $RepoDir @GitArgs 2>$null }
+    }
     finally { $ErrorActionPreference = $prev }
     [pscustomobject]@{ Code = $LASTEXITCODE; Output = (($out | Out-String).TrimEnd("`r","`n")) }
 }
@@ -347,10 +352,22 @@ function Test-OdsGitIntegrity {
     if (-not (Test-Path -LiteralPath $gitDir)) { return $true }
     $head = Invoke-OdsGit -RepoDir $Project.local -GitArgs @('rev-parse','--verify','--quiet','HEAD')
     if ($head.Code -ne 0) { return $true }   # unborn HEAD (no commits) is valid (E54)
-    $fsck = Invoke-OdsGit -RepoDir $Project.local -GitArgs @('fsck','--connectivity-only')
+    # --no-dangling: dangling objects are normal gc/rebase churn, not corruption.
+    # fsck's non-zero exit is frequently just a broken refs/remotes/*/HEAD symbolic ref
+    # (cosmetic — origin/HEAD pointing at 0000...), which must NOT exclude an otherwise
+    # healthy repo from sync. Only genuine object corruption makes a repo unsafe to copy,
+    # so inspect the captured output and fail only on missing/broken/unreadable objects.
+    $fsck = Invoke-OdsGit -RepoDir $Project.local -GitArgs @('fsck','--connectivity-only','--no-dangling') -CaptureStderr
     if ($fsck.Code -ne 0) {
-        Write-OdsLog "git fsck failed for $($Project.id): $($fsck.Output)" 'ERROR'
-        return $false
+        $serious = @($fsck.Output -split "`n" | Where-Object {
+            $_ -match '(?i)(missing|broken link|corrupt|unable to read|bad object|bad tree|bad commit|sha1 mismatch)' -and
+            $_ -notmatch 'refs/remotes/'
+        })
+        if ($serious.Count) {
+            Write-OdsLog "git fsck found corruption in $($Project.id): $(($serious -join '; ').Trim())" 'ERROR'
+            return $false
+        }
+        Write-OdsLog "git fsck notices for $($Project.id) (broken remote ref / dangling) - syncing anyway." 'INFO'
     }
     return $true
 }
