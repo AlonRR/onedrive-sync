@@ -8,11 +8,14 @@
     -ShowWindow / onedrive-sync.ps1 -Gui). All actions call the shared core.
 
 .PARAMETER ShowWindow  Open the management window immediately.
+.PARAMETER NoStart     Define all functions but do not start the tray (mutex,
+                       icon, timers, message loop). Used by the test harness to
+                       load the tray's functions for headless inspection.
 #>
-param([switch]$ShowWindow)
+param([switch]$ShowWindow, [switch]$NoStart)
 
 # WPF requires STA - relaunch under Windows PowerShell STA if needed.
-if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA' -and -not $NoStart) {
     $argsList = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$($MyInvocation.MyCommand.Path)`"")
     if ($ShowWindow) { $argsList += '-ShowWindow' }
     Start-Process powershell.exe -ArgumentList $argsList -WindowStyle Hidden
@@ -41,12 +44,16 @@ if (-not [System.Windows.Application]::Current) { $null = New-Object System.Wind
 
 # Single instance: a second launch (e.g. the Start Menu shortcut) signals the running
 # tray to open its window instead of adding a duplicate tray icon, then exits.
-$script:OdsInstanceNew   = $false
-$script:OdsInstanceMutex = New-Object System.Threading.Mutex($true, 'Local\OneDriveCodeSyncTray', [ref]$script:OdsInstanceNew)
-$script:OdsShowEvent     = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\OneDriveCodeSyncTrayShow')
-if (-not $script:OdsInstanceNew) {
-    if ($ShowWindow) { [void]$script:OdsShowEvent.Set() }
-    return
+# Skipped under -NoStart so the test harness can load functions without grabbing the
+# real tray's mutex (an `if` block does not create a new scope, so these stay script-scoped).
+if (-not $NoStart) {
+    $script:OdsInstanceNew   = $false
+    $script:OdsInstanceMutex = New-Object System.Threading.Mutex($true, 'Local\OneDriveCodeSyncTray', [ref]$script:OdsInstanceNew)
+    $script:OdsShowEvent     = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\OneDriveCodeSyncTrayShow')
+    if (-not $script:OdsInstanceNew) {
+        if ($ShowWindow) { [void]$script:OdsShowEvent.Set() }
+        return
+    }
 }
 
 $script:Cfg            = $null
@@ -60,6 +67,10 @@ $script:StartedAt             = [datetime]::Now  # startup time for stale-grace-
 $script:WindowRefreshCallback = $null            # scriptblock set by open management window; cleared on close
 $script:MainWin               = $null            # singleton management window (hidden when minimized to tray)
 $script:WinForceClose         = $false           # $true when Exit intentionally closes the window
+$script:winGrid               = $null            # open window's controls, published by Show-OdsWindow so the
+$script:winLblCounts          = $null            # script-scope Refresh-Data can update them from the timer's
+$script:winLblLastSync        = $null            # foreign scope (a nested function / closure could not)
+$script:winIdleBrush          = $null
 function Get-Cfg { if (-not $script:Cfg) { $script:Cfg = Import-OdsConfig }; return $script:Cfg }
 
 function Test-OdsSyncRunning {
@@ -819,6 +830,80 @@ $MainXaml = @'
 </Window>
 '@
 
+# Refresh the open management window's grid. Defined at SCRIPT scope (not nested in
+# Show-OdsWindow) so the timer tick's foreign-scope `& $script:WindowRefreshCallback`
+# resolves it — a nested function would not. The open window publishes its controls to
+# $script:win* (see Show-OdsWindow); this is only called while a window is open.
+function Refresh-Data {
+    param([switch]$Force)
+    if ($null -eq $script:MainWin) { return }   # window closed — nothing to update
+    if ($Force) {
+        # Async path: null cache, restart background scan, show placeholder, return.
+        $script:CachedRows = $null
+        if ($null -ne $script:RefreshHandle) {
+            # Stop the in-flight pipeline before disposing, else the runspace worker
+            # thread is abandoned (a slow leak on every force-refresh).
+            try { $script:RefreshHandle.PS.Stop() }    catch {}
+            try { $script:RefreshHandle.PS.Dispose() } catch {}
+            try { $script:RefreshHandle.RS.Dispose() } catch {}
+            $script:RefreshHandle = $null
+        }
+        Start-StatusRefresh
+        $script:timer.Interval = 2000   # poll quickly until the scan completes
+        $script:winLblCounts.Text = 'Refreshing...'
+        return
+    }
+    # Non-force path (includes initial open): use cache if warm, else scan once.
+    $lastSyncs = Get-LastSyncPerProject
+    $base = if ($null -ne $script:CachedRows) {
+        $script:CachedRows
+    } else {
+        $cmpState = (Get-OdsMachineState).compare
+        $live = [object[]]@(@(Get-OdsProjectStatus -Config (Get-Cfg)) | ForEach-Object {
+            $cmpMode = if ($null -ne $cmpState.PSObject.Properties[$_.Id]) { $cmpState.$($_.Id) } else { 'default' }
+            [PSCustomObject]@{
+                Id           = $_.Id
+                Status       = $_.Status
+                Kind         = $_.Kind
+                Git          = if ($_.Git) { 'git' } else { 'plain' }
+                LocalPresent = if ($_.LocalPresent) { 'yes' } else { '-' }
+                Conflicts    = $_.Conflicts
+                Compare      = $cmpMode
+                Dot          = Get-StatusBrush $_.Status $_.Conflicts
+            }
+        })
+        $script:CachedRows = $live
+        Update-TrayIcon
+        $live
+    }
+    # Merge fresh per-project last-sync times into display rows (new objects; cache intact)
+    $src = [object[]]@($base | ForEach-Object {
+        [PSCustomObject]@{
+            # Recompute Dot if a cached row lacks it (defensive: a missing property
+            # would otherwise throw under StrictMode and crash the refresh).
+            Dot          = if ($_.PSObject.Properties['Dot']) { $_.Dot } else { Get-StatusBrush $_.Status $_.Conflicts }
+            Id           = $_.Id
+            Status       = $_.Status
+            Kind         = $_.Kind
+            Git          = $_.Git
+            LocalPresent = $_.LocalPresent
+            Conflicts    = $_.Conflicts
+            Compare      = $_.Compare
+            LastSync     = if ($lastSyncs.ContainsKey($_.Id)) { $lastSyncs[$_.Id] } else { '-' }
+        }
+    })
+    $preSelected = @($script:winGrid.SelectedItems | ForEach-Object { $_.Id })
+    $script:winGrid.ItemsSource = $src
+    foreach ($item in $script:winGrid.Items) {
+        if ($preSelected -contains $item.Id) { $script:winGrid.SelectedItems.Add($item) }
+    }
+    $script:winLblLastSync.Foreground = $script:winIdleBrush
+    $script:winLblLastSync.Text = Get-LastSyncText
+    $active    = @($src | Where-Object { $_.Status -eq 'active' }).Count
+    $conflicts = [int](($src | Measure-Object -Property Conflicts -Sum).Sum)
+    $script:winLblCounts.Text = "$active active" + $(if ($conflicts -gt 0) { ' | ' + $conflicts + ' conflict(s)' } else { '' })
+}
+
 function Show-OdsWindow {
     if ($null -ne $script:MainWin) {
         # The window is shown modally (ShowDialog) and only Hidden on close, so the
@@ -849,74 +934,15 @@ function Show-OdsWindow {
     $lblCounts     = $win.FindName('lblCounts')
     $idleTextBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString('#555555')
 
-    function Refresh-Data {
-        param([switch]$Force)
-        if ($Force) {
-            # Async path: null cache, restart background scan, show placeholder, return immediately.
-            $script:CachedRows = $null
-            if ($null -ne $script:RefreshHandle) {
-                # Stop the in-flight pipeline before disposing, else the runspace
-                # worker thread is abandoned (a slow leak on every force-refresh).
-                try { $script:RefreshHandle.PS.Stop() }    catch {}
-                try { $script:RefreshHandle.PS.Dispose() } catch {}
-                try { $script:RefreshHandle.RS.Dispose() } catch {}
-                $script:RefreshHandle = $null
-            }
-            Start-StatusRefresh
-            $timer.Interval  = 2000   # poll quickly until the scan completes
-            $lblCounts.Text  = 'Refreshing...'
-            return
-        }
-        # Non-force path (includes initial open): use cache if warm, else scan once synchronously.
-        $lastSyncs = Get-LastSyncPerProject
-        $base = if ($null -ne $script:CachedRows) {
-            $script:CachedRows
-        } else {
-            $cmpState = (Get-OdsMachineState).compare
-            $live = [object[]]@(@(Get-OdsProjectStatus -Config (Get-Cfg)) | ForEach-Object {
-                $cmpMode = if ($null -ne $cmpState.PSObject.Properties[$_.Id]) { $cmpState.$($_.Id) } else { 'default' }
-                [PSCustomObject]@{
-                    Id           = $_.Id
-                    Status       = $_.Status
-                    Kind         = $_.Kind
-                    Git          = if ($_.Git) { 'git' } else { 'plain' }
-                    LocalPresent = if ($_.LocalPresent) { 'yes' } else { '-' }
-                    Conflicts    = $_.Conflicts
-                    Compare      = $cmpMode
-                    Dot          = Get-StatusBrush $_.Status $_.Conflicts
-                }
-            })
-            $script:CachedRows = $live
-            Update-TrayIcon
-            $live
-        }
-        # Merge fresh per-project last-sync times into display rows (creates new objects; does not mutate cache)
-        $src = [object[]]@($base | ForEach-Object {
-            [PSCustomObject]@{
-                # Recompute Dot if a cached row lacks it (defensive: a missing property
-                # would otherwise throw under StrictMode and crash the refresh).
-                Dot          = if ($_.PSObject.Properties['Dot']) { $_.Dot } else { Get-StatusBrush $_.Status $_.Conflicts }
-                Id           = $_.Id
-                Status       = $_.Status
-                Kind         = $_.Kind
-                Git          = $_.Git
-                LocalPresent = $_.LocalPresent
-                Conflicts    = $_.Conflicts
-                Compare      = $_.Compare
-                LastSync     = if ($lastSyncs.ContainsKey($_.Id)) { $lastSyncs[$_.Id] } else { '-' }
-            }
-        })
-        $preSelected = @($grid.SelectedItems | ForEach-Object { $_.Id })
-        $grid.ItemsSource = $src
-        foreach ($item in $grid.Items) {
-            if ($preSelected -contains $item.Id) { $grid.SelectedItems.Add($item) }
-        }
-        $lblLastSync.Foreground = $idleTextBrush
-        $lblLastSync.Text = Get-LastSyncText
-        $active    = @($src | Where-Object { $_.Status -eq 'active' }).Count
-        $conflicts = [int](($src | Measure-Object -Property Conflicts -Sum).Sum)
-        $lblCounts.Text = "$active active" + $(if ($conflicts -gt 0) { ' | ' + $conflicts + ' conflict(s)' } else { '' })
-    }
+    # Publish this window's controls to $script: vars so the SCRIPT-scope Refresh-Data
+    # function (defined above this function) can update them when it is invoked from the
+    # timer tick's foreign scope. A nested function or GetNewClosure both fail here: a
+    # nested function is unresolvable off Show-OdsWindow's stack, and a closure's
+    # $script: refers to its own dynamic-module scope, not the real tray globals.
+    $script:winGrid        = $grid
+    $script:winLblCounts   = $lblCounts
+    $script:winLblLastSync = $lblLastSync
+    $script:winIdleBrush   = $idleTextBrush
 
     function Get-SelectedIds { @($grid.SelectedItems | ForEach-Object { $_.Id }) }
 
@@ -995,7 +1021,9 @@ function Show-OdsWindow {
         if ($ids.Count -eq 1) { Show-OdsProjectSettings -ProjectId $ids[0]; Refresh-Data -Force }
     })
 
-    # Register callback so the timer tick can push completed background scans into the grid.
+    # Register the refresh callback so the timer tick can push completed background
+    # scans into the grid. { Refresh-Data } resolves because Refresh-Data is a SCRIPT
+    # function (a nested function would not resolve from the timer's foreign scope).
     $script:WindowRefreshCallback = { Refresh-Data }
     $win.Add_Closed({
         $script:WindowRefreshCallback = $null
@@ -1391,8 +1419,12 @@ function Show-OdsSettings {
 }
 
 # ---------------------------------------------------------------------------
-#  Tray icon  (WinForms NotifyIcon - WPF has no built-in tray support)
+#  Tray runtime: icon, context menu, timers, WinForms message loop.
+#  Gated by -NoStart so the test harness can dot-source this file to load the
+#  functions above WITHOUT starting a real tray. An `if` block does not create a
+#  new scope in PowerShell, so $icon/$timer/$menu stay script-scoped as before.
 # ---------------------------------------------------------------------------
+if (-not $NoStart) {
 $icon = New-Object System.Windows.Forms.NotifyIcon
 $icon.Icon = New-StatusIcon 'DimGray'
 $icon.Text = 'OneDrive Sync'
@@ -1508,3 +1540,4 @@ $script:OdsShowTimer.Start()
 if ($ShowWindow) { try { Show-OdsWindow } catch {} }
 [System.Windows.Forms.Application]::Run()
 $icon.Visible = $false
+}   # end if (-not $NoStart)
