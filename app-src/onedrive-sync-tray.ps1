@@ -912,6 +912,11 @@ function Refresh-Data {
             LastSync     = if ($lastSyncs.ContainsKey($_.Id)) { $lastSyncs[$_.Id] } else { '-' }
         }
     })
+    # Never mutate the management grid while a sub-window (Project Settings, etc.) is
+    # modally open on top of it: reassigning a DataGrid's ItemsSource / rebuilding its
+    # selection under a nested ShowDialog can crash WPF re-entrantly. The cache above is
+    # already updated, so the grid refreshes on the next tick once the sub-window closes.
+    if ([System.Windows.Application]::Current -and @([System.Windows.Application]::Current.Windows).Count -gt 1) { return }
     $preSelected = @($script:winGrid.SelectedItems | ForEach-Object { $_.Id })
     $script:winGrid.ItemsSource = $src
     foreach ($item in $script:winGrid.Items) {
@@ -1468,6 +1473,27 @@ function Show-OdsSettings {
 #  new scope in PowerShell, so $icon/$timer/$menu stay script-scoped as before.
 # ---------------------------------------------------------------------------
 if (-not $NoStart) {
+# Global safety net: a crash in any window, handler, or timer must be logged and must
+# NOT take down the tray. WinForms UI-thread exceptions route to ThreadException; WPF
+# (ShowDialog) handler exceptions route to the Dispatcher. Catch BOTH, log the type +
+# message + a little stack, and keep running. This is the catch-all behind the
+# per-handler guards - it turns an opaque process-death into a logged, survivable event.
+try { [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException) } catch {}
+[System.Windows.Forms.Application]::add_ThreadException({
+    param($s, $e)
+    try { Write-OdsLog "Tray UI exception (WinForms): $($e.Exception.GetType().Name): $($e.Exception.Message)" 'ERROR' } catch {}
+})
+if ([System.Windows.Application]::Current) {
+    [System.Windows.Application]::Current.add_DispatcherUnhandledException({
+        param($s, $e)
+        try {
+            $st = ($e.Exception.StackTrace -split "`n" | Select-Object -First 3) -join ' | '
+            Write-OdsLog "Tray UI exception (WPF): $($e.Exception.GetType().Name): $($e.Exception.Message) [$st]" 'ERROR'
+        } catch {}
+        $e.Handled = $true   # keep the tray alive after logging
+    })
+}
+
 $icon = New-Object System.Windows.Forms.NotifyIcon
 $icon.Icon = New-StatusIcon 'DimGray'
 $icon.Text = 'OneDrive Sync'
