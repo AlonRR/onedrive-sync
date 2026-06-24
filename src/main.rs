@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use ods::config::Config;
 use ods::engine::{bisync, BisyncOpts};
 use ods::paths::Paths;
-use ods::state::{Catalog, MachineState, Status};
+use ods::state::{Catalog, MachineState};
 
 #[derive(Parser)]
 #[command(name = "ods", about = "OneDrive two-way code sync (Rust)", version)]
@@ -27,6 +27,8 @@ enum Cmd {
     },
     /// Print the generated rclone filter for a project (for validation).
     Filter { id: String },
+    /// Open the management window + system tray.
+    Gui,
 }
 
 fn main() -> Result<()> {
@@ -165,6 +167,9 @@ fn main() -> Result<()> {
                 Some(p) => print!("{}", ods::filter::generate(p, &config)),
                 None => eprintln!("no project matching '{}'", id),
             }
+        }
+        Cmd::Gui => {
+            ods::gui::run_gui(paths, config).map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
     }
     Ok(())

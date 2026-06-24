@@ -9,6 +9,7 @@ pub mod engine;
 pub mod events;
 pub mod filter;
 pub mod git;
+pub mod gui;
 pub mod paths;
 pub mod run;
 pub mod state;
