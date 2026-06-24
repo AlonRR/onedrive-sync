@@ -12,6 +12,7 @@ use md5::{Digest, Md5};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use walkdir::WalkDir;
 
 /// Workdir/version key: first 16 hex chars of MD5(id.to_lowercase()).
 pub fn id_hash(id: &str) -> String {
@@ -133,7 +134,13 @@ pub fn bisync(
     );
 
     let timeout = Duration::from_secs(config.run_time_budget.max(1800));
+    // Serialize on THIS project's workdir so a manual sync and the scheduled run
+    // (or the still-live PowerShell tool during shadow) can't collide on it. The
+    // lock file sits beside the workdir, matching Invoke-OdsWithProjectLock.
+    let lock_path = paths.bisync_dir().join(format!("{idh}.lock"));
+    let _plock = crate::jsonio::lock_or_break(&lock_path, Duration::from_secs(600));
     let code = run_rclone(&rclone_path(paths), &args, timeout, paths, &project.id);
+    drop(_plock);
 
     events::write_event(
         paths,
@@ -176,6 +183,190 @@ fn run_rclone(rclone: &Path, args: &[String], timeout: Duration, paths: &Paths, 
             Err(_) => return -1,
         }
     }
+}
+
+/// Workdir for a project id (bisync listing + filter), keyed by id-hash.
+pub fn workdir(paths: &Paths, id: &str) -> PathBuf {
+    paths.bisync_dir().join(id_hash(id))
+}
+
+/// True once bisync has established a baseline (it drops `*.lst` listings in the
+/// workdir). Port of Test-OdsBaselineExists.
+pub fn baseline_exists(paths: &Paths, id: &str) -> bool {
+    let wd = workdir(paths, id);
+    std::fs::read_dir(&wd)
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .ends_with(".lst")
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Drop a project's baseline so the next run does a clean --resync. Default removes
+/// the whole workdir; `listing_only` keeps the filter but wipes the `*.lst` listings
+/// (used after a corrupt-baseline integrity failure). Port of Reset-OdsBaseline.
+pub fn reset_baseline(paths: &Paths, id: &str, listing_only: bool) {
+    let wd = workdir(paths, id);
+    if !wd.is_dir() {
+        return;
+    }
+    if listing_only {
+        if let Ok(rd) = std::fs::read_dir(&wd) {
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().to_lowercase().ends_with(".lst") {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    } else {
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+}
+
+/// Result of the pre-sync idle-stability gate.
+pub struct Gate {
+    pub ok: bool,
+    pub reason: &'static str,
+    pub transient: bool,
+}
+
+/// Pre-sync gate (port of Test-OdsGate): defer a project whose OneDrive side is
+/// mid-write, or whose git is active, so we never bisync a half-written tree.
+pub fn gate(project: &Project, config: &Config) -> Gate {
+    let secs = config.idle_stability_seconds;
+    if !tree_stable(&project.dest, secs) {
+        return Gate { ok: false, reason: "onedrive-busy", transient: true };
+    }
+    if project.git && !git_quiesced(&project.local, secs) {
+        return Gate { ok: false, reason: "git-active", transient: true };
+    }
+    Gate { ok: true, reason: "", transient: false }
+}
+
+/// True if nothing under `dir` was written in the last `stable_seconds`. Returns
+/// early on the first too-recent file (matching Select-Object -First 1).
+fn tree_stable(dir: &Path, stable_seconds: u64) -> bool {
+    if !dir.exists() {
+        return true;
+    }
+    !any_recent_file(dir, stable_seconds, false)
+}
+
+/// Like tree_stable but for a repo's `.git`: a present `*.lock` OR a recent write
+/// means git is mid-operation. Port of Test-OdsGitQuiesced.
+fn git_quiesced(repo_local: &Path, stable_seconds: u64) -> bool {
+    let git_dir = repo_local.join(".git");
+    if !git_dir.exists() {
+        return true; // plain or unborn
+    }
+    !any_recent_file(&git_dir, stable_seconds, true)
+}
+
+/// Walk `dir`; return true on the first file modified within `stable_seconds`, or
+/// (when `lock_counts`) on the first `*.lock` file. Bounded by early return.
+fn any_recent_file(dir: &Path, stable_seconds: u64, lock_counts: bool) -> bool {
+    for entry in WalkDir::new(dir).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if lock_counts
+            && entry.file_name().to_string_lossy().to_lowercase().ends_with(".lock")
+        {
+            return true;
+        }
+        let recent = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| t.elapsed().map(|e| e.as_secs() < stable_seconds).unwrap_or(false))
+            .unwrap_or(false);
+        if recent {
+            return true;
+        }
+    }
+    false
+}
+
+/// First-run seed (port of Invoke-OdsSeed): when both sides are non-empty and there
+/// is no baseline yet, archive the OLDER copy of every differing file before the
+/// initial --resync (which keeps the newer side) can overwrite it — newest wins,
+/// nothing is lost.
+pub fn seed(paths: &Paths, project: &Project) {
+    let (local, dest) = (&project.local, &project.dest);
+    if !local.exists() || !dest.exists() {
+        return;
+    }
+    let local_files: Vec<PathBuf> = WalkDir::new(local)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_path_buf())
+        .collect();
+    let dest_has_files = WalkDir::new(dest)
+        .into_iter()
+        .flatten()
+        .any(|e| e.file_type().is_file());
+    if local_files.is_empty() || !dest_has_files {
+        return;
+    }
+
+    let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let archive = paths
+        .versions_dir()
+        .join(id_hash(&project.id))
+        .join(format!("seed-{stamp}"));
+
+    for lf in &local_files {
+        let Ok(rel) = lf.strip_prefix(local) else { continue };
+        let df = dest.join(rel);
+        if !df.is_file() {
+            continue;
+        }
+        let (Some(lh), Some(dh)) = (file_sha256(lf), file_sha256(&df)) else { continue };
+        if lh == dh {
+            continue; // identical — nothing to preserve
+        }
+        let lt = file_mtime(lf);
+        let dt = file_mtime(&df);
+        if let (Some(lt), Some(dt)) = (lt, dt) {
+            let skew_hours = lt.duration_since(dt).or_else(|_| dt.duration_since(lt))
+                .map(|d| d.as_secs() / 3600).unwrap_or(0);
+            if skew_hours > 48 {
+                events::log(paths, "WARN", &format!(
+                    "Large mtime gap on '{}' during seed ({skew_hours}h) — check machine clocks.",
+                    rel.display()));
+            }
+            // The loser is the OLDER file; --resync keeps the newer, so archive the older.
+            let (loser, loser_root) = if lt >= dt { (df.as_path(), dest.as_path()) } else { (lf.as_path(), local.as_path()) };
+            save_archive_copy(loser, loser_root, &archive);
+        }
+    }
+    events::write_event(paths, "seed", serde_json::json!({"id": project.id}));
+}
+
+fn save_archive_copy(source: &Path, root: &Path, archive_dir: &Path) {
+    let Ok(rel) = source.strip_prefix(root) else { return };
+    let target = archive_dir.join(rel);
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::copy(source, &target);
+}
+
+fn file_sha256(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).ok()?;
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 /// Write the filter only when it changed (trim-compared, BOM-tolerant). Returns
