@@ -29,6 +29,18 @@ pub struct Config {
     pub compare_mode: String,
     pub rclone_transfers: u32,
     pub run_time_budget: u64,
+
+    /// OneDrive-idle gate window: a project whose dest/.git changed within this many
+    /// seconds is deferred (transient) rather than synced mid-write.
+    pub idle_stability_seconds: u64,
+    /// Smart-retry of transiently-gated repos within a run.
+    pub retry_max_attempts: u32,
+    /// Backoff (seconds) between gated-repo retries; last value repeats.
+    pub retry_backoff: Vec<u64>,
+    /// Cap total backoff wait per run before deferring to the next cycle.
+    pub retry_max_wait_seconds: u64,
+    /// Escalate (log ERROR) a repo deferred this many consecutive cycles.
+    pub defer_escalate_cycles: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +77,11 @@ impl Default for Config {
             compare_mode: "modtime".to_string(),
             rclone_transfers: 4,
             run_time_budget: 1500,
+            idle_stability_seconds: 60,
+            retry_max_attempts: 4,
+            retry_backoff: vec![5, 10, 20],
+            retry_max_wait_seconds: 120,
+            defer_escalate_cycles: 5,
         }
     }
 }
