@@ -46,23 +46,32 @@ pub fn discover(paths: &Paths, config: &Config, catalog: &Catalog) -> Vec<Projec
     let mut seen: HashSet<String> = HashSet::new();
     let excludes: HashSet<&str> = config.exclude_dirs.iter().map(|s| s.as_str()).collect();
 
-    // 1) Mirror projects: git repos under each parent.
-    for parent in config.project_parent_paths(paths) {
-        for repo in find_git_repos(&parent, &excludes) {
-            let Some(id) = rel_under(&repo, &paths.onedrive) else {
-                continue;
-            };
-            if catalog.is_forgotten(&id) || !seen.insert(id.to_lowercase()) {
-                continue;
+    // 1) Mirror projects: scan BOTH the OneDrive parent and the mirrored local
+    //    parent, so a locally-created repo not yet on OneDrive is still found
+    //    (its dest doesn't exist yet — the run loop auto-activates + pushes it).
+    //    id = path relative to the OneDrive root, else relative to the profile.
+    for rel in &config.project_parents {
+        let od_parent = paths.onedrive.join(rel);
+        let local_parent = paths.user_profile.join(rel);
+        for side in [od_parent, local_parent] {
+            for repo in find_git_repos(&side, &excludes) {
+                let Some(id) = rel_under(&repo, &paths.onedrive)
+                    .or_else(|| rel_under(&repo, &paths.user_profile))
+                else {
+                    continue;
+                };
+                if catalog.is_forgotten(&id) || !seen.insert(id.to_lowercase()) {
+                    continue;
+                }
+                out.push(Project {
+                    name: leaf(&id),
+                    local: paths.user_profile.join(rel_to_pathbuf(&id)),
+                    dest: paths.onedrive.join(rel_to_pathbuf(&id)),
+                    kind: Kind::Mirror,
+                    git: true,
+                    id,
+                });
             }
-            out.push(Project {
-                name: leaf(&id),
-                local: paths.user_profile.join(rel_to_pathbuf(&id)),
-                dest: repo,
-                kind: Kind::Mirror,
-                git: true,
-                id,
-            });
         }
     }
 
