@@ -218,7 +218,9 @@ pub fn run(paths: &Paths, config: &Config, opts: RunOpts) -> String {
         .iter()
         .filter(|p| active_ids.iter().any(|a| a.eq_ignore_ascii_case(&p.id)))
         .collect();
-    active.sort_by(|a, b| last_change(b).cmp(&last_change(a)));
+    // Cache each project's last-change key so its tree (incl. the OneDrive dest) is
+    // walked once, not O(log n) times inside the comparator. Reverse = newest first.
+    active.sort_by_cached_key(|p| std::cmp::Reverse(last_change(p)));
 
     let deadline = Instant::now() + Duration::from_secs(config.run_time_budget);
     let mut order: Vec<String> = Vec::new();
