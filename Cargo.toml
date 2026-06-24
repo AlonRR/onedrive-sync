@@ -14,3 +14,11 @@ serde_json = "1.0.150"
 toml = "1.1.2"
 tray-icon = "0.24.1"
 walkdir = "2.5.0"
+
+# Small, optimized release binary. Unwinding is kept (no panic="abort") so a
+# panic in a background sync thread is contained instead of killing the tray.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
