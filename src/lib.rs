@@ -12,6 +12,7 @@ pub mod events;
 pub mod filter;
 pub mod git;
 pub mod gui;
+pub mod icon;
 pub mod jsonio;
 pub mod paths;
 pub mod prune;

@@ -16,6 +16,10 @@ toml = "1.1.2"
 tray-icon = "0.24.1"
 walkdir = "2.5.0"
 
+[build-dependencies]
+ico = "0.4.0"
+winresource = "0.1.19"
+
 # Small, optimized release binary. Unwinding is kept (no panic="abort") so a
 # panic in a background sync thread is contained instead of killing the tray.
 [profile.release]
