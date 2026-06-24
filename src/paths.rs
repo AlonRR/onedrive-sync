@@ -80,6 +80,9 @@ impl Paths {
     /// drive root, the user profile / OneDrive / system roots, or an ancestor of any.
     /// Fails closed — an empty/unparseable path is treated as protected.
     pub fn is_protected_root(&self, path: &std::path::Path) -> bool {
+        if path.as_os_str().to_string_lossy().trim().is_empty() {
+            return true; // blank/whitespace fails closed
+        }
         let full = normalize(path);
         if full.is_empty() {
             return true;
@@ -107,19 +110,63 @@ impl Paths {
 }
 
 fn normalize(p: &std::path::Path) -> String {
-    // Absolutize best-effort, then trim a trailing separator.
-    let s = std::fs::canonicalize(p)
-        .ok()
-        .and_then(|c| {
-            // Strip the \\?\ verbatim prefix canonicalize adds on Windows.
-            let c = c.to_string_lossy().to_string();
-            Some(c.strip_prefix(r"\\?\").map(|x| x.to_string()).unwrap_or(c))
-        })
-        .unwrap_or_else(|| p.to_string_lossy().to_string());
-    s.trim_end_matches(['\\', '/']).to_string()
+    // Lexical absolutize (like [IO.Path]::GetFullPath) — existence-independent, no
+    // symlink resolution, so it behaves the same for a dest that doesn't exist yet.
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().map(|c| c.join(p)).unwrap_or_else(|_| p.to_path_buf())
+    };
+    abs.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_string()
 }
 
 fn starts_with_ci(haystack: &str, prefix: &str) -> bool {
     haystack.len() >= prefix.len()
         && haystack[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn rel_under_basics() {
+        let root = Path::new(r"C:\Users\me\OneDrive");
+        assert_eq!(rel_under(Path::new(r"C:\Users\me\OneDrive\Projects\app"), root).as_deref(), Some(r"Projects\app"));
+        // Equal to root -> empty string (callers must reject this).
+        assert_eq!(rel_under(root, root).as_deref(), Some(""));
+        // Not under root -> None.
+        assert_eq!(rel_under(Path::new(r"C:\Other\x"), root), None);
+        // A sibling that merely shares a prefix string is NOT under.
+        assert_eq!(rel_under(Path::new(r"C:\Users\me\OneDriveX\y"), root), None);
+    }
+
+    #[test]
+    fn overlap_detects_nesting_either_way() {
+        let a = Path::new(r"C:\a\b");
+        assert!(paths_overlap(a, Path::new(r"C:\a\b")));
+        assert!(paths_overlap(a, Path::new(r"C:\a\b\c")));
+        assert!(paths_overlap(a, Path::new(r"C:\a")));
+        assert!(!paths_overlap(a, Path::new(r"C:\a\bb")));
+    }
+
+    #[test]
+    fn protected_root_fails_closed() {
+        let p = Paths {
+            local_root: PathBuf::from(r"C:\Users\me\AppData\Local\onedrive-sync"),
+            onedrive: PathBuf::from(r"C:\Users\me\OneDrive"),
+            user_profile: PathBuf::from(r"C:\Users\me"),
+        };
+        assert!(p.is_protected_root(Path::new(r"C:\Users\me")), "the profile root itself");
+        assert!(p.is_protected_root(Path::new(r"C:\Users\me\OneDrive")), "the onedrive root");
+        assert!(p.is_protected_root(Path::new(r"C:\Users")), "an ancestor of a root");
+        assert!(p.is_protected_root(Path::new(r"C:\")), "a drive root");
+        assert!(p.is_protected_root(Path::new("   ")), "blank fails closed");
+        // A real project folder under the profile is NOT protected.
+        assert!(!p.is_protected_root(Path::new(r"C:\Users\me\Projects\app")));
+    }
 }

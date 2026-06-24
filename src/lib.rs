@@ -3,6 +3,7 @@
 //! The engine orchestrates `rclone bisync` + `git` per project. This library
 //! holds the reusable pieces; `main.rs` is the CLI and (later) the tray/GUI.
 
+pub mod actions;
 pub mod config;
 pub mod conflicts;
 pub mod discovery;

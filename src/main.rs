@@ -1,9 +1,13 @@
+//! ods CLI — a thin command surface over the shared engine. Every management
+//! command shares the library, so it behaves identically to the tray/GUI.
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ods::config::Config;
-use ods::engine::{bisync, BisyncOpts};
+use ods::discovery::discover;
 use ods::paths::Paths;
-use ods::state::{Catalog, MachineState};
+use ods::state::{Catalog, MachineState, Status};
+use ods::{actions, conflicts, events, run};
 
 #[derive(Parser)]
 #[command(name = "ods", about = "OneDrive two-way code sync (Rust)", version)]
@@ -16,7 +20,7 @@ struct Cli {
 enum Cmd {
     /// List known projects and their per-machine status.
     List,
-    /// Show a last-run / errors summary.
+    /// Show a last-run / errors / needs-attention summary.
     Status,
     /// Sync one project by id, or all if omitted.
     Sync {
@@ -24,9 +28,45 @@ enum Cmd {
         /// Preview without changing files.
         #[arg(long)]
         dry_run: bool,
+        /// Raise the delete-brake to 100% for this run (allow mass deletions).
+        #[arg(long)]
+        approve_deletes: bool,
     },
+    /// Force a fresh bisync baseline for a project id (or all active if omitted).
+    Resync { id: Option<String> },
+    /// Pull a project local on this machine (skip/undecided/forgotten -> active).
+    Pull { id: String },
+    /// Stop syncing a project here (keep the OneDrive copy).
+    Unmap {
+        id: String,
+        /// Also remove the local copy (refused on a protected root).
+        #[arg(long)]
+        delete_local: bool,
+    },
+    /// Retire a project globally (tombstone). Reversible with `pull`.
+    Forget { id: String },
+    /// Map a local folder to an arbitrary OneDrive destination (watch project).
+    AddWatch { local: String, dest: String },
+    /// Restore a project (or one --file) from the local version archive.
+    Restore {
+        id: String,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        at: Option<String>,
+    },
+    /// List unresolved conflict files across projects.
+    Conflicts,
+    /// Interactively choose which available projects to sync locally.
+    Discover,
+    /// Pause the scheduled sync (runs skip until `resume`).
+    Pause,
+    /// Resume the scheduled sync.
+    Resume,
     /// Print the generated rclone filter for a project (for validation).
     Filter { id: String },
+    /// Write a diagnostic bundle (logs + config + state) to %TEMP%.
+    Diag,
     /// Open the management window + system tray.
     Gui,
 }
@@ -36,31 +76,35 @@ fn main() -> Result<()> {
     let paths = Paths::discover()?;
     let config = Config::load(&paths)?;
 
-    match cli.cmd {
+    if let Err(e) = dispatch(cli.cmd, &paths, &config) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn list_projects(paths: &Paths, config: &Config) -> Vec<ods::discovery::Project> {
+    discover(paths, config, &Catalog::load(paths))
+}
+
+/// `--approve-deletes` raises the brake to 100% for this run (matches the PS tool
+/// cloning the config with MaxDeletePercent=100).
+fn with_approve(config: &Config, approve: bool) -> Config {
+    let mut c = config.clone();
+    if approve {
+        c.max_delete_percent = 100;
+    }
+    c
+}
+
+fn dispatch(cmd: Cmd, paths: &Paths, config: &Config) -> Result<(), String> {
+    match cmd {
         Cmd::List => {
-            let state = MachineState::load(&paths);
-            let catalog = Catalog::load(&paths);
+            let state = MachineState::load(paths);
+            let catalog = Catalog::load(paths);
+            let projects = discover(paths, config, &catalog);
             println!("local root : {}", paths.local_root.display());
             println!("onedrive   : {}", paths.onedrive.display());
-            println!(
-                "parents    : {}",
-                config
-                    .project_parent_paths(&paths)
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            println!(
-                "watch roots: {}",
-                config
-                    .watch_root_paths(&paths)
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            let projects = ods::discovery::discover(&paths, &config, &catalog);
             println!(
                 "state      : {} active, {} skip, {} catalog entries, {} tombstones",
                 state.active.len(),
@@ -70,27 +114,32 @@ fn main() -> Result<()> {
             );
             println!("\n{} project(s):", projects.len());
             for p in &projects {
+                let conflicts = if p.local.exists() {
+                    conflicts::scan(p).len()
+                } else {
+                    0
+                };
+                let cflag = if conflicts > 0 { format!(" !{conflicts}c") } else { String::new() };
                 println!(
-                    "  {:7} {:5} {:10} {}",
+                    "  {:9} {:5} {:10} {}{}",
                     p.kind.as_str(),
                     if p.git { "git" } else { "plain" },
                     state.status_of(&p.id).as_str(),
-                    p.id
+                    p.id,
+                    cflag
                 );
             }
         }
         Cmd::Status => {
-            match ods::events::last_run_end(&paths) {
-                Some(e) => println!(
-                    "last run-end : {}  ({})",
-                    e.summary.as_deref().unwrap_or("?"),
-                    e.ts
-                ),
+            match events::last_run_end(paths) {
+                Some(e) => println!("last run-end : {}  ({})", e.summary.as_deref().unwrap_or("?"), e.ts),
                 None => println!("last run-end : (none recent)"),
             }
+            if actions::is_paused(paths) {
+                println!("paused       : yes (resume to re-enable)");
+            }
             if let Ok(text) = std::fs::read_to_string(paths.log_file()) {
-                let mut errs: Vec<&str> =
-                    text.lines().filter(|l| l.contains("[ERROR]")).collect();
+                let mut errs: Vec<&str> = text.lines().filter(|l| l.contains("[ERROR]")).collect();
                 let recent: Vec<&str> = errs.split_off(errs.len().saturating_sub(5));
                 if recent.is_empty() {
                     println!("recent errors: none");
@@ -101,76 +150,162 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            let att = ods::events::attention_ids(&paths);
-            if att.is_empty() {
-                println!("needs attention: none");
-            } else {
-                println!("needs attention: {}", att.join(", "));
+            let att = events::attention_ids(paths);
+            println!("needs attention: {}", if att.is_empty() { "none".into() } else { att.join(", ") });
+        }
+        Cmd::Sync { id, dry_run, approve_deletes } => {
+            let cfg = with_approve(config, approve_deletes);
+            match id {
+                Some(want) => {
+                    let list = list_projects(paths, &cfg);
+                    let rid = actions::resolve_id(&list, &want, false)?;
+                    let Some(p) = list.iter().find(|p| p.id == rid) else {
+                        println!("No project matching '{want}'.");
+                        return Ok(());
+                    };
+                    let st = MachineState::load(paths);
+                    let (status, _) = run::sync_project(paths, &cfg, &st, p, dry_run, false);
+                    println!("{:55} -> {status}", p.id);
+                }
+                None => {
+                    let summary = run::run(paths, &cfg, run::RunOpts { dry_run, ignore_pause: true });
+                    println!("Run complete. {}", if summary.is_empty() { "(skipped)" } else { &summary });
+                }
             }
         }
-        Cmd::Sync { id, dry_run } => match id {
-            // A single project: bisync just that one (the -SyncNow <id> path).
-            Some(want) => {
-                let state = MachineState::load(&paths);
-                let catalog = Catalog::load(&paths);
-                let projects = ods::discovery::discover(&paths, &config, &catalog);
-                let Some(p) = projects.iter().find(|p| p.id.eq_ignore_ascii_case(&want)) else {
-                    eprintln!("no project matching '{want}'");
-                    return Ok(());
-                };
-                if p.git {
-                    if let Err(e) = ods::git::integrity_ok(&p.local) {
-                        ods::events::log(
-                            &paths,
-                            "ERROR",
-                            &format!("git fsck found corruption in {}: {}", p.id, e),
-                        );
-                        return Ok(());
+        Cmd::Resync { id } => {
+            let resolved = match &id {
+                Some(want) if want != "*" => {
+                    let list = list_projects(paths, config);
+                    Some(actions::resolve_id(&list, want, false)?)
+                }
+                _ => None,
+            };
+            actions::resync(paths, config, resolved.as_deref());
+            println!("Resync complete.");
+        }
+        Cmd::Pull { id } => {
+            let list = list_projects(paths, config);
+            let rid = actions::resolve_id(&list, &id, false)?;
+            let status = actions::pull(paths, config, &rid)?;
+            println!("{rid} -> {status}");
+        }
+        Cmd::Unmap { id, delete_local } => {
+            let list = list_projects(paths, config);
+            let rid = actions::resolve_id(&list, &id, true)?;
+            actions::unmap(paths, config, &rid, delete_local)?;
+        }
+        Cmd::Forget { id } => {
+            let list = list_projects(paths, config);
+            let rid = actions::resolve_id(&list, &id, true)?;
+            actions::forget(paths, &rid);
+        }
+        Cmd::AddWatch { local, dest } => {
+            let rid = actions::add_watch(paths, std::path::Path::new(&local), std::path::Path::new(&dest))?;
+            println!("Mapped watch project -> {rid}");
+        }
+        Cmd::Restore { id, file, at } => {
+            let list = list_projects(paths, config);
+            let rid = actions::resolve_id(&list, &id, true)?;
+            actions::restore(paths, config, &rid, at.as_deref(), file.as_deref())?;
+            println!("Restored {rid}.");
+        }
+        Cmd::Conflicts => {
+            let found = actions::list_conflicts(paths, config);
+            if found.is_empty() {
+                println!("No unresolved conflicts.");
+            } else {
+                for (id, files) in found {
+                    println!("{id}:");
+                    for f in files {
+                        println!("   {}", f.display());
                     }
                 }
-                let code = bisync(
-                    &paths,
-                    &config,
-                    &state,
-                    p,
-                    BisyncOpts {
-                        dry_run,
-                        ..Default::default()
-                    },
-                );
-                let class = if code == 0 {
-                    "ok"
-                } else if code < 8 {
-                    "warn"
-                } else {
-                    "error"
-                };
-                println!("{:55} code={code} -> {class}", p.id);
-            }
-            // No id: the full scheduled/default run (lock, events, summary).
-            None => {
-                let summary = ods::run::run(
-                    &paths,
-                    &config,
-                    ods::run::RunOpts {
-                        dry_run,
-                        ignore_pause: false,
-                    },
-                );
-                println!("Run complete. {}", if summary.is_empty() { "(skipped)" } else { &summary });
-            }
-        },
-        Cmd::Filter { id } => {
-            let catalog = Catalog::load(&paths);
-            let projects = ods::discovery::discover(&paths, &config, &catalog);
-            match projects.iter().find(|p| p.id.eq_ignore_ascii_case(&id)) {
-                Some(p) => print!("{}", ods::filter::generate(p, &config)),
-                None => eprintln!("no project matching '{}'", id),
             }
         }
+        Cmd::Discover => discover_interactive(paths, config),
+        Cmd::Pause => actions::pause(paths),
+        Cmd::Resume => actions::resume(paths),
+        Cmd::Filter { id } => {
+            let list = list_projects(paths, config);
+            match list.iter().find(|p| p.id.eq_ignore_ascii_case(&id)) {
+                Some(p) => print!("{}", ods::filter::generate(p, config)),
+                None => eprintln!("no project matching '{id}'"),
+            }
+        }
+        Cmd::Diag => write_diag(paths, config),
         Cmd::Gui => {
-            ods::gui::run_gui(paths, config).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            ods::gui::run_gui(paths.clone(), config.clone()).map_err(|e| e.to_string())?;
         }
     }
     Ok(())
+}
+
+/// Interactive picker for undecided projects (the CLI half of -Discover). New
+/// watch-root repos that need a destination are listed with an add-watch hint.
+fn discover_interactive(paths: &Paths, config: &Config) {
+    let state = MachineState::load(paths);
+    let projects = list_projects(paths, config);
+    let undecided: Vec<&ods::discovery::Project> = projects
+        .iter()
+        .filter(|p| state.status_of(&p.id) == Status::Undecided)
+        .collect();
+    if undecided.is_empty() {
+        println!("No new projects awaiting a decision.");
+        return;
+    }
+    println!("New projects available to sync on this machine:");
+    for (i, p) in undecided.iter().enumerate() {
+        println!("  [{}] {}  ({})", i + 1, p.name, p.id);
+    }
+    print!("Enter numbers to PULL (comma-separated), 'a' for all, Enter to skip all: ");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return;
+    }
+    let ans = line.trim();
+    let chosen: Vec<usize> = if ans.eq_ignore_ascii_case("a") {
+        (0..undecided.len()).collect()
+    } else {
+        ans.split([',', ' '])
+            .filter_map(|t| t.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1 && *n <= undecided.len())
+            .map(|n| n - 1)
+            .collect()
+    };
+    for (i, p) in undecided.iter().enumerate() {
+        if chosen.contains(&i) {
+            match actions::pull(paths, config, &p.id) {
+                Ok(s) => println!("pulled {} -> {s}", p.id),
+                Err(e) => println!("  {e}"),
+            }
+        } else {
+            ods::state::set_state(paths, &p.id, Status::Skip);
+        }
+    }
+}
+
+fn write_diag(paths: &Paths, config: &Config) {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let temp = std::env::var("TEMP").unwrap_or_else(|_| ".".into());
+    let bundle = std::path::Path::new(&temp).join(format!("ods-diag-{stamp}.txt"));
+    let mut out = String::new();
+    out.push_str("# ods diagnostics — NOT redacted; contains full paths and recent log lines.\n");
+    out.push_str("=== config ===\n");
+    out.push_str(&serde_json::to_string_pretty(config).unwrap_or_default());
+    out.push_str("\n=== machine-state ===\n");
+    out.push_str(&serde_json::to_string_pretty(&MachineState::load(paths)).unwrap_or_default());
+    out.push_str("\n=== recent log ===\n");
+    if let Ok(text) = std::fs::read_to_string(paths.log_file()) {
+        let tail: Vec<&str> = text.lines().rev().take(200).collect();
+        for l in tail.iter().rev() {
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    if std::fs::write(&bundle, out).is_ok() {
+        println!("Diagnostic bundle: {}", bundle.display());
+    }
 }

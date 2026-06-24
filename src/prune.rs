@@ -97,3 +97,76 @@ fn remove(run: &Path, dry: bool) {
         let _ = std::fs::remove_dir_all(run);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::paths::Paths;
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("ods-prune-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    fn mkrun(versions: &Path, proj: &str, run: &str, bytes: usize) {
+        let d = versions.join(proj).join(run);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f.bin"), vec![0u8; bytes]).unwrap();
+    }
+
+    /// With the size cap forced to 0, prune deletes everything it is ALLOWED to —
+    /// but every project must keep at least its newest run (the last restore point).
+    #[test]
+    fn never_deletes_a_projects_last_run() {
+        let root = temp_root("guard");
+        let paths = Paths {
+            local_root: root.clone(),
+            onedrive: root.join("od"),
+            user_profile: root.join("up"),
+        };
+        let versions = paths.versions_dir();
+        for proj in ["A", "B"] {
+            for run in ["20260101T000000Z", "20260201T000000Z", "20260301T000000Z"] {
+                mkrun(&versions, proj, run, 1024);
+            }
+        }
+        let mut config = Config::default();
+        config.version_max_gb = 0; // force the size cap to bite
+        config.version_retention_days = 36_500; // disable age expiry
+
+        let deleted = version_prune(&paths, &config, false);
+        assert!(!deleted.is_empty(), "size cap should have deleted something");
+        for proj in ["A", "B"] {
+            let remaining = super::subdirs(&versions.join(proj));
+            assert_eq!(remaining.len(), 1, "project {proj} must keep exactly its newest run");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Dry mode reports what it would delete but touches nothing on disk.
+    #[test]
+    fn dry_mode_deletes_nothing() {
+        let root = temp_root("dry");
+        let paths = Paths {
+            local_root: root.clone(),
+            onedrive: root.join("od"),
+            user_profile: root.join("up"),
+        };
+        let versions = paths.versions_dir();
+        for run in ["20260101T000000Z", "20260201T000000Z"] {
+            mkrun(&versions, "A", run, 1024);
+        }
+        let mut config = Config::default();
+        config.version_max_gb = 0;
+        config.version_retention_days = 0; // everything is "old"
+
+        let would = version_prune(&paths, &config, true);
+        assert!(!would.is_empty());
+        for run in would {
+            assert!(run.exists(), "dry mode must not delete {}", run.display());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
