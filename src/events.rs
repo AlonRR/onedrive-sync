@@ -92,6 +92,20 @@ pub fn last_run_end(paths: &Paths) -> Option<Event> {
     ends.pop()
 }
 
+/// Most-recent bisync timestamp per project id (today + yesterday), for the GUI's
+/// "last sync" column.
+pub fn last_sync_per_project(paths: &Paths) -> BTreeMap<String, String> {
+    let mut last: BTreeMap<String, String> = BTreeMap::new();
+    for e in recent_events(paths) {
+        if e.event == "bisync" {
+            if let Some(id) = e.id {
+                last.insert(id, e.ts);
+            }
+        }
+    }
+    last
+}
+
 /// Ids whose most-recent real (non-dry-run) bisync did not succeed (code != 0).
 pub fn attention_ids(paths: &Paths) -> Vec<String> {
     let mut last: BTreeMap<String, i32> = BTreeMap::new();
