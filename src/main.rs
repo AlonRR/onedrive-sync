@@ -31,6 +31,9 @@ enum Cmd {
         /// Raise the delete-brake to 100% for this run (allow mass deletions).
         #[arg(long)]
         approve_deletes: bool,
+        /// Run even if paused (the no-id run honors paused.flag by default).
+        #[arg(long)]
+        force: bool,
     },
     /// Force a fresh bisync baseline for a project id (or all active if omitted).
     Resync { id: Option<String> },
@@ -153,9 +156,11 @@ fn dispatch(cmd: Cmd, paths: &Paths, config: &Config) -> Result<(), String> {
             let att = events::attention_ids(paths);
             println!("needs attention: {}", if att.is_empty() { "none".into() } else { att.join(", ") });
         }
-        Cmd::Sync { id, dry_run, approve_deletes } => {
+        Cmd::Sync { id, dry_run, approve_deletes, force } => {
             let cfg = with_approve(config, approve_deletes);
             match id {
+                // A single project is always an explicit action — like -SyncNow <id>,
+                // it syncs directly and does not consult the pause flag.
                 Some(want) => {
                     let list = list_projects(paths, &cfg);
                     let rid = actions::resolve_id(&list, &want, false)?;
@@ -167,9 +172,15 @@ fn dispatch(cmd: Cmd, paths: &Paths, config: &Config) -> Result<(), String> {
                     let (status, _) = run::sync_project(paths, &cfg, &st, p, dry_run, false);
                     println!("{:55} -> {status}", p.id);
                 }
+                // The no-id run is the scheduled/default run: it HONORS paused.flag
+                // (the authoritative, elevation-free pause). --force overrides it.
                 None => {
-                    let summary = run::run(paths, &cfg, run::RunOpts { dry_run, ignore_pause: true });
-                    println!("Run complete. {}", if summary.is_empty() { "(skipped)" } else { &summary });
+                    let summary = run::run(paths, &cfg, run::RunOpts { dry_run, ignore_pause: force });
+                    if summary.is_empty() {
+                        println!("Run complete. ({})", if actions::is_paused(paths) { "paused — use --force to override" } else { "skipped" });
+                    } else {
+                        println!("Run complete. {summary}");
+                    }
                 }
             }
         }
