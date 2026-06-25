@@ -3,10 +3,12 @@
 //! immediate-mode, so there is no retained-mode/dynamic-scope crash surface —
 //! the class that plagued the WPF tray.
 //!
-//! The styling follows mainstream desktop-UI guidance: WCAG-AA contrast (light
-//! text on a dark surface, status shown by colour AND text/badge, never colour
-//! alone), generous spacing and click targets, a clear visual hierarchy, an
-//! always-visible system-status line, and an accessibility text-zoom control.
+//! Layout follows mainstream desktop-app convention: a top title bar with the
+//! global actions, a left navigation rail, a persistent bottom status bar
+//! (Nielsen "visibility of system status"), and a central content area. The
+//! styling keeps the accessibility invariants of the prior restyle: WCAG-AA
+//! contrast, status shown by colour AND text/badge (never colour alone),
+//! generous spacing and click targets, and a text-zoom control.
 
 use crate::config::Config;
 use crate::discovery::discover;
@@ -16,7 +18,7 @@ use crate::state::{Catalog, MachineState, Status};
 use crate::{actions, conflicts, events, icon};
 use eframe::egui;
 use egui::{Color32, RichText};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
@@ -31,6 +33,12 @@ const C_ACCENT: Color32 = Color32::from_rgb(74, 142, 240);
 const C_TEXT: Color32 = Color32::from_rgb(232, 234, 238);
 const C_DIM: Color32 = Color32::from_rgb(150, 156, 166);
 
+// Surface palette (layered darkest -> lightest so regions read as distinct planes).
+const C_BG: Color32 = Color32::from_rgb(22, 24, 29); // central content
+const C_NAV: Color32 = Color32::from_rgb(28, 30, 37); // left rail
+const C_BAR: Color32 = Color32::from_rgb(17, 19, 23); // title + status bars
+const C_CARD: Color32 = Color32::from_rgb(33, 36, 44); // groups / detail panel
+
 #[derive(PartialEq, Clone, Copy)]
 enum View {
     Projects,
@@ -43,9 +51,11 @@ struct Row {
     id: String,
     kind: &'static str,
     git: bool,
+    local: bool,
     status: String,
     attention: bool,
     conflicts: usize,
+    compare: String,
     last_sync: Option<String>,
 }
 
@@ -88,6 +98,17 @@ fn make_icon(rgb: [u8; 3]) -> Icon {
     Icon::from_rgba(icon::rgba(32, rgb), 32, 32).expect("icon")
 }
 
+/// A filled accent "primary" button (white label for contrast on the blue fill).
+fn primary(text: &str) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text.to_string()).strong().color(Color32::WHITE)).fill(C_ACCENT)
+}
+
+/// Open a folder in Explorer, fire-and-forget. (explorer.exe returns a nonzero
+/// exit code even on success, so we never inspect the result.)
+fn open_in_explorer(path: &Path) {
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+}
+
 /// Format an ISO-8601 timestamp as a coarse "Nm ago" age.
 fn ago(ts: &str) -> String {
     let Ok(t) = chrono::DateTime::parse_from_rfc3339(ts) else { return "?".into() };
@@ -103,6 +124,20 @@ fn ago(ts: &str) -> String {
     } else {
         format!("{}d ago", secs / 86_400)
     }
+}
+
+/// Middle-ellipsis a long id so its meaningful leaf stays visible (full id on hover).
+fn shorten(id: &str, max: usize) -> String {
+    let chars: Vec<char> = id.chars().collect();
+    if chars.len() <= max {
+        return id.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let head = keep / 2;
+    let tail = keep - head;
+    let h: String = chars[..head].iter().collect();
+    let t: String = chars[chars.len() - tail..].iter().collect();
+    format!("{h}…{t}")
 }
 
 /// A colour+text status chip (never colour alone — the word carries the meaning too).
@@ -171,9 +206,11 @@ impl GuiApp {
             .map(|p| Row {
                 kind: p.kind.as_str(),
                 git: p.git,
+                local: p.local.exists(),
                 status: self.state.status_of(&p.id).as_str().to_string(),
                 attention: att.iter().any(|a| a.eq_ignore_ascii_case(&p.id)),
                 conflicts: if p.local.exists() { conflicts::scan(p).len() } else { 0 },
+                compare: self.state.compare.get(&p.id).cloned().unwrap_or_else(|| self.config.compare_mode.clone()),
                 last_sync: last_sync.get(&p.id).map(|ts| ago(ts)),
                 id: p.id.clone(),
             })
@@ -200,6 +237,14 @@ impl GuiApp {
         self.sel_compare = self.state.compare.get(id).cloned().unwrap_or_else(|| self.config.compare_mode.clone());
         self.sel_maxdelete = self.state.max_delete.get(id).map(|n| n.to_string()).unwrap_or_default();
         self.conflict_view = None;
+    }
+
+    /// Local + OneDrive paths for a project id (re-discovered on demand, click-time only).
+    fn project_paths(&self, id: &str) -> Option<(PathBuf, PathBuf)> {
+        discover(&self.paths, &self.config, &Catalog::load(&self.paths))
+            .into_iter()
+            .find(|p| p.id == id)
+            .map(|p| (p.local, p.dest))
     }
 
     fn run_job<F>(&mut self, msg: &str, f: F)
@@ -229,18 +274,20 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
+        // --- Once-per-frame housekeeping (must stay before the panels so the tray
+        //     menu keeps pumping and background jobs are reaped). ---
         if self.logo.is_none() {
             let img = egui::ColorImage::from_rgba_unmultiplied([48, 48], &icon::rgba(48, icon::BRAND));
-            self.logo = Some(ui.ctx().load_texture("ods-logo", img, egui::TextureOptions::LINEAR));
+            self.logo = Some(ctx.load_texture("ods-logo", img, egui::TextureOptions::LINEAR));
         }
-
-        // Tray menu events.
         let mut want_sync = false;
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             if ev.id == self.quit_id {
                 std::process::exit(0);
             } else if ev.id == self.show_id {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             } else if ev.id == self.sync_id {
                 want_sync = true;
             }
@@ -249,8 +296,6 @@ impl eframe::App for GuiApp {
         if want_sync {
             self.run_job("syncing all…", |p, c| run(p, c, RunOpts { dry_run: false, ignore_pause: true }));
         }
-
-        // Collect a completed background job.
         if let Some(rx) = &self.rx {
             if let Ok(result) = rx.try_recv() {
                 self.busy = false;
@@ -259,38 +304,51 @@ impl eframe::App for GuiApp {
                 self.refresh();
             }
         }
+        ctx.request_repaint_after(Duration::from_millis(400));
 
-        self.header(ui);
-        ui.add_space(4.0);
-        self.tab_bar(ui);
-        ui.add_space(6.0);
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.view {
-            View::Projects => self.view_projects(ui),
-            View::Pending => self.view_pending(ui),
-            View::Retired => self.view_retired(ui),
-            View::AddWatch => self.view_add_watch(ui),
+        // --- Chrome: title bar / nav rail / status bar / central content. Nested
+        //     with show_inside since eframe::App::ui already hands us a CentralPanel Ui. ---
+        let bar = egui::Frame::default().fill(C_BAR).inner_margin(egui::Margin::symmetric(14, 9));
+        egui::Panel::top("titlebar").frame(bar).show_inside(ui, |ui| self.titlebar(ui));
+
+        let status = egui::Frame::default().fill(C_BAR).inner_margin(egui::Margin::symmetric(14, 7));
+        egui::Panel::bottom("statusbar").frame(status).show_inside(ui, |ui| self.statusbar(ui));
+
+        let nav = egui::Frame::default().fill(C_NAV).inner_margin(egui::Margin::symmetric(10, 14));
+        egui::Panel::left("nav").exact_size(172.0).resizable(false).frame(nav).show_inside(ui, |ui| self.nav(ui));
+
+        // Selected-project detail as a fixed bottom drawer (actions stay visible
+        // instead of scrolling off the end of a long grid).
+        if self.view == View::Projects && self.selected.is_some() {
+            let drawer = egui::Frame::default().fill(C_CARD).inner_margin(egui::Margin::symmetric(18, 12));
+            egui::Panel::bottom("detail").resizable(false).frame(drawer).show_inside(ui, |ui| self.detail_panel(ui));
+        }
+
+        let central = egui::Frame::default().fill(C_BG).inner_margin(egui::Margin::symmetric(18, 14));
+        egui::CentralPanel::default().frame(central).show_inside(ui, |ui| {
+            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| match self.view {
+                View::Projects => self.view_projects(ui),
+                View::Pending => self.view_pending(ui),
+                View::Retired => self.view_retired(ui),
+                View::AddWatch => self.view_add_watch(ui),
+            });
         });
-
-        ui.ctx().request_repaint_after(Duration::from_millis(400));
     }
 }
 
 impl GuiApp {
-    fn header(&mut self, ui: &mut egui::Ui) {
+    fn titlebar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if let Some(logo) = &self.logo {
-                ui.add(egui::Image::new(logo).fit_to_exact_size(egui::vec2(28.0, 28.0)));
+                ui.add(egui::Image::new(logo).fit_to_exact_size(egui::vec2(26.0, 26.0)));
             }
-            ui.heading("OneDrive Sync");
-            if self.busy {
-                ui.add_space(6.0);
-                ui.spinner();
-                ui.label(RichText::new(&self.busy_msg).color(C_ACCENT));
-            }
+            ui.add_space(4.0);
+            ui.label(RichText::new("OneDrive Sync").size(19.0).strong());
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Pause / resume.
+                // Pause / resume (rightmost).
                 if self.paused {
-                    if ui.button(RichText::new("Resume").strong()).on_hover_text("Re-enable the scheduled sync").clicked() {
+                    if ui.add(primary("Resume")).on_hover_text("Re-enable the scheduled sync").clicked() {
                         actions::resume(&self.paths);
                         self.refresh();
                     }
@@ -305,49 +363,74 @@ impl GuiApp {
                 if ui.add_enabled(z < 1.79, egui::Button::new("A+")).on_hover_text("Larger text").clicked() {
                     self.set_zoom(ui.ctx(), z + 0.1);
                 }
-                ui.label(RichText::new(format!("{}%", (z * 100.0).round() as i32)).color(C_DIM));
+                ui.label(RichText::new(format!("{}%", (z * 100.0).round() as i32)).color(C_DIM).small());
                 if ui.add_enabled(z > 0.81, egui::Button::new("A-")).on_hover_text("Smaller text").clicked() {
                     self.set_zoom(ui.ctx(), z - 0.1);
                 }
-            });
-        });
-
-        // System-status line: last run + a one-line action result.
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Last run:").color(C_DIM));
-            let lr = self.last_run.clone();
-            let col = if lr.contains("error") { C_ATTENTION } else if lr.contains("warn") { C_UNDECIDED } else { C_OK };
-            ui.label(RichText::new(&lr).color(col).strong());
-            if !self.status_msg.is_empty() {
                 ui.separator();
-                ui.label(RichText::new(&self.status_msg).color(C_DIM).italics());
-            }
-        });
-
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if ui.button("Refresh").clicked() {
-                self.refresh();
-            }
-            if ui.add_enabled(!self.busy, egui::Button::new("Dry-run all")).on_hover_text("Preview every active project; changes nothing").clicked() {
-                self.run_job("previewing…", |p, c| run(p, c, RunOpts { dry_run: true, ignore_pause: true }));
-            }
-            if ui.add_enabled(!self.busy, egui::Button::new(RichText::new("Sync all").strong())).clicked() {
-                self.run_job("syncing all…", |p, c| run(p, c, RunOpts { dry_run: false, ignore_pause: true }));
-            }
+                // Global run actions.
+                if ui.add_enabled(!self.busy, primary("Sync all")).on_hover_text("Sync every active project now").clicked() {
+                    self.run_job("syncing all…", |p, c| run(p, c, RunOpts { dry_run: false, ignore_pause: true }));
+                }
+                if ui.add_enabled(!self.busy, egui::Button::new("Dry-run all")).on_hover_text("Preview every active project; changes nothing").clicked() {
+                    self.run_job("previewing…", |p, c| run(p, c, RunOpts { dry_run: true, ignore_pause: true }));
+                }
+                if ui.button("Refresh").clicked() {
+                    self.refresh();
+                }
+            });
         });
     }
 
-    fn tab_bar(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
+    fn nav(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(2.0);
+        ui.label(RichText::new("VIEWS").size(11.0).color(C_DIM).strong());
+        ui.add_space(8.0);
+        self.nav_item(ui, View::Projects, "Projects".to_string());
+        let plabel = if self.pending.is_empty() { "Pending".to_string() } else { format!("Pending  ({})", self.pending.len()) };
+        self.nav_item(ui, View::Pending, plabel);
+        self.nav_item(ui, View::Retired, "Retired".to_string());
+        self.nav_item(ui, View::AddWatch, "Add watch".to_string());
+    }
+
+    fn nav_item(&mut self, ui: &mut egui::Ui, view: View, label: String) {
+        let selected = self.view == view;
+        let resp = ui.add_sized(
+            [ui.available_width(), 34.0],
+            egui::Button::selectable(selected, RichText::new(label).size(15.0)),
+        );
+        if resp.clicked() {
+            self.view = view;
+        }
+        ui.add_space(3.0);
+    }
+
+    fn statusbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.view, View::Projects, RichText::new("Projects").size(15.0));
-            let plabel = if self.pending.is_empty() { "Pending".to_string() } else { format!("Pending ({})", self.pending.len()) };
-            ui.selectable_value(&mut self.view, View::Pending, RichText::new(plabel).size(15.0));
-            ui.selectable_value(&mut self.view, View::Retired, RichText::new("Retired").size(15.0));
-            ui.selectable_value(&mut self.view, View::AddWatch, RichText::new("Add watch").size(15.0));
+            ui.label(RichText::new("Last run").color(C_DIM).small());
+            let lr = self.last_run.clone();
+            let col = if lr.contains("error") { C_ATTENTION } else if lr.contains("warn") { C_UNDECIDED } else { C_OK };
+            ui.label(RichText::new(&lr).color(col).strong());
+            ui.separator();
+            let n = self.rows.len();
+            let att = self.rows.iter().filter(|r| r.attention || r.conflicts > 0).count();
+            ui.label(RichText::new(format!("{n} projects")).color(C_DIM));
+            if att > 0 {
+                ui.label(RichText::new(format!("· {att} need attention")).color(C_ATTENTION).strong());
+            }
+            if self.paused {
+                ui.separator();
+                badge(ui, "PAUSED", C_UNDECIDED, Color32::BLACK);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.busy {
+                    ui.spinner();
+                    ui.label(RichText::new(&self.busy_msg).color(C_ACCENT));
+                } else if !self.status_msg.is_empty() {
+                    ui.label(RichText::new(&self.status_msg).color(C_DIM).italics());
+                }
+            });
         });
-        ui.separator();
     }
 
     fn view_projects(&mut self, ui: &mut egui::Ui) {
@@ -359,7 +442,7 @@ impl GuiApp {
             badge(ui, "undecided", C_UNDECIDED, Color32::BLACK);
             badge(ui, "attention", C_ATTENTION, Color32::WHITE);
         });
-        ui.add_space(2.0);
+        ui.add_space(4.0);
         // Filter box (recognition over recall; scales to many projects).
         ui.horizontal(|ui| {
             ui.label(RichText::new("Filter:").color(C_DIM));
@@ -368,7 +451,7 @@ impl GuiApp {
                 self.filter.clear();
             }
         });
-        ui.add_space(4.0);
+        ui.add_space(6.0);
 
         let needle = self.filter.to_lowercase();
         let visible: Vec<usize> = (0..self.rows.len())
@@ -376,46 +459,42 @@ impl GuiApp {
             .collect();
 
         let mut clicked: Option<String> = None;
-        let mut resync: Option<String> = None;
-        let mut sync: Option<String> = None;
-        egui::Grid::new("projects").striped(true).num_columns(7).spacing([14.0, 9.0]).show(ui, |ui| {
-            for h in ["STATUS", "KIND", "GIT", "LAST SYNC", "CONFLICTS", "PROJECT", ""] {
+        egui::Grid::new("projects").striped(true).num_columns(8).spacing([14.0, 10.0]).show(ui, |ui| {
+            for h in ["STATUS", "KIND", "GIT", "LOCAL", "LAST SYNC", "CONFLICTS", "COMPARE", "PROJECT"] {
                 ui.label(RichText::new(h).color(C_DIM).small().strong());
             }
             ui.end_row();
             for &i in &visible {
                 let r = &self.rows[i];
-                // status badge
-                let (fill, fg) = match r.status.as_str() {
-                    "active" => (C_OK, Color32::WHITE),
-                    "skip" => (C_SKIP, Color32::WHITE),
-                    _ => (C_UNDECIDED, Color32::BLACK),
-                };
+                // status badge (attention overrides; both colour AND word).
                 if r.attention {
                     badge(ui, "attention", C_ATTENTION, Color32::WHITE);
                 } else {
+                    let (fill, fg) = match r.status.as_str() {
+                        "active" => (C_OK, Color32::WHITE),
+                        "skip" => (C_SKIP, Color32::WHITE),
+                        _ => (C_UNDECIDED, Color32::BLACK),
+                    };
                     badge(ui, &r.status, fill, fg);
                 }
                 ui.label(r.kind);
                 ui.label(if r.git { "git" } else { "-" });
+                if r.local {
+                    ui.label(RichText::new("yes").color(C_OK));
+                } else {
+                    ui.label(RichText::new("no").color(C_DIM));
+                }
                 ui.label(RichText::new(r.last_sync.clone().unwrap_or_else(|| "-".into())).color(C_DIM));
                 if r.conflicts > 0 {
                     badge(ui, &format!("{}", r.conflicts), C_ATTENTION, Color32::WHITE);
                 } else {
                     ui.label(RichText::new("-").color(C_DIM));
                 }
+                ui.label(RichText::new(&r.compare).color(C_DIM));
                 let sel = self.selected.as_deref() == Some(r.id.as_str());
-                if ui.selectable_label(sel, RichText::new(&r.id).monospace()).on_hover_text("Select for settings & actions").clicked() {
+                if ui.selectable_label(sel, RichText::new(shorten(&r.id, 34)).monospace()).on_hover_text(&r.id).clicked() {
                     clicked = Some(r.id.clone());
                 }
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(!self.busy, egui::Button::new("Sync")).on_hover_text("Sync this project now").clicked() {
-                        sync = Some(r.id.clone());
-                    }
-                    if ui.add_enabled(!self.busy, egui::Button::new("Resync")).on_hover_text("Rebuild the baseline (recover a stuck project)").clicked() {
-                        resync = Some(r.id.clone());
-                    }
-                });
                 ui.end_row();
             }
         });
@@ -426,24 +505,6 @@ impl GuiApp {
 
         if let Some(id) = clicked {
             self.select(&id);
-        }
-        if let Some(id) = sync {
-            self.run_job(&format!("syncing {id}…"), move |p, c| {
-                let st = MachineState::load(p);
-                let list = discover(p, c, &Catalog::load(p));
-                match list.iter().find(|x| x.id == id) {
-                    Some(proj) => { let (s, _) = crate::run::sync_project(p, c, &st, proj, false, false); format!("{id}: {s}") }
-                    None => format!("no project '{id}'"),
-                }
-            });
-        }
-        if let Some(id) = resync {
-            self.run_job(&format!("resyncing {id}…"), move |p, c| { actions::resync(p, c, Some(&id)); format!("resync {id} done") });
-        }
-
-        if self.selected.is_some() {
-            ui.add_space(8.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| self.detail_panel(ui));
         }
     }
 
@@ -460,7 +521,43 @@ impl GuiApp {
         if self.selected.is_none() {
             return;
         }
-        ui.add_space(4.0);
+        ui.add_space(8.0);
+
+        // Primary actions: sync / resync / open folders.
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!self.busy, primary("Sync")).on_hover_text("Sync this project now").clicked() {
+                let pid = id.clone();
+                self.run_job(&format!("syncing {pid}…"), move |p, c| {
+                    let st = MachineState::load(p);
+                    let list = discover(p, c, &Catalog::load(p));
+                    match list.iter().find(|x| x.id == pid) {
+                        Some(proj) => { let (s, _) = crate::run::sync_project(p, c, &st, proj, false, false); format!("{pid}: {s}") }
+                        None => format!("no project '{pid}'"),
+                    }
+                });
+            }
+            if ui.add_enabled(!self.busy, egui::Button::new("Resync")).on_hover_text("Rebuild the baseline (recover a stuck project)").clicked() {
+                let pid = id.clone();
+                self.run_job(&format!("resyncing {pid}…"), move |p, c| { actions::resync(p, c, Some(&pid)); format!("resync {pid} done") });
+            }
+            ui.separator();
+            if ui.button("Open local").on_hover_text("Open the local folder in Explorer").clicked() {
+                if let Some((local, _)) = self.project_paths(&id) {
+                    open_in_explorer(&local);
+                }
+            }
+            if ui.button("Open OneDrive").on_hover_text("Open the OneDrive destination in Explorer").clicked() {
+                if let Some((_, dest)) = self.project_paths(&id) {
+                    open_in_explorer(&dest);
+                }
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // Per-project settings.
         ui.horizontal(|ui| {
             ui.label("Compare:");
             egui::ComboBox::from_id_salt("compare").selected_text(&self.sel_compare).show_ui(ui, |ui| {
@@ -478,7 +575,12 @@ impl GuiApp {
                 self.refresh();
             }
         });
-        ui.add_space(6.0);
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // Lifecycle actions.
         ui.horizontal(|ui| {
             if ui.button("View conflicts").clicked() {
                 let list = discover(&self.paths, &self.config, &Catalog::load(&self.paths));
@@ -510,7 +612,7 @@ impl GuiApp {
         });
 
         if let Some((cid, files)) = self.conflict_view.clone() {
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             ui.label(RichText::new(format!("Conflicts in {cid}:")).strong());
             if files.is_empty() {
                 ui.label(RichText::new("  (none)").color(C_DIM));
@@ -529,10 +631,10 @@ impl GuiApp {
             return;
         }
         ui.label("New projects available to sync on this machine:");
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         let mut activate: Option<String> = None;
         let mut skip: Option<String> = None;
-        egui::Grid::new("pending").striped(true).num_columns(4).spacing([14.0, 9.0]).show(ui, |ui| {
+        egui::Grid::new("pending").striped(true).num_columns(4).spacing([14.0, 10.0]).show(ui, |ui| {
             for h in ["NAME", "KIND", "PROJECT", ""] {
                 ui.label(RichText::new(h).color(C_DIM).small().strong());
             }
@@ -542,7 +644,7 @@ impl GuiApp {
                 ui.label(&p.kind);
                 ui.monospace(&p.id);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(!self.busy, egui::Button::new(RichText::new("Activate").strong())).clicked() {
+                    if ui.add_enabled(!self.busy, primary("Activate")).clicked() {
                         activate = Some(p.id.clone());
                     }
                     if ui.button("Skip").clicked() {
@@ -571,9 +673,9 @@ impl GuiApp {
             return;
         }
         ui.label("Retired projects — Revive re-activates and syncs them here:");
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         let mut revive: Option<String> = None;
-        egui::Grid::new("retired").striped(true).num_columns(2).spacing([14.0, 9.0]).show(ui, |ui| {
+        egui::Grid::new("retired").striped(true).num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
             for id in &self.forgotten {
                 ui.monospace(id);
                 if ui.add_enabled(!self.busy, egui::Button::new("Revive")).clicked() {
@@ -592,8 +694,8 @@ impl GuiApp {
 
     fn view_add_watch(&mut self, ui: &mut egui::Ui) {
         ui.label("Map a local folder to an arbitrary OneDrive destination (watch project).");
-        ui.add_space(6.0);
-        egui::Grid::new("addwatch").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+        ui.add_space(8.0);
+        egui::Grid::new("addwatch").num_columns(2).spacing([10.0, 12.0]).show(ui, |ui| {
             ui.label("Local folder (under your profile):");
             ui.add(egui::TextEdit::singleline(&mut self.watch_local).hint_text(r"C:\Users\you\Code\my-project").desired_width(440.0));
             ui.end_row();
@@ -601,8 +703,8 @@ impl GuiApp {
             ui.add(egui::TextEdit::singleline(&mut self.watch_dest).hint_text(r"…\OneDrive\Tools\my-project").desired_width(440.0));
             ui.end_row();
         });
-        ui.add_space(6.0);
-        if ui.button(RichText::new("Add watch mapping").strong()).clicked() {
+        ui.add_space(8.0);
+        if ui.add(primary("Add watch mapping")).clicked() {
             let (local, dest) = (self.watch_local.trim().to_string(), self.watch_dest.trim().to_string());
             if local.is_empty() || dest.is_empty() {
                 self.status_msg = "both folders are required".into();
@@ -616,13 +718,13 @@ impl GuiApp {
     }
 }
 
-/// Tuned dark theme: high-contrast text, generous spacing, comfortable click
-/// targets, and a readable type scale.
+/// Tuned dark theme: layered surfaces, rounded widgets, high-contrast text,
+/// generous spacing, comfortable click targets, and a readable type scale.
 fn configure_style(ctx: &egui::Context) {
-    use egui::{FontFamily::Proportional, FontId, TextStyle};
+    use egui::{CornerRadius, FontFamily::Proportional, FontId, Stroke, TextStyle};
     let mut style = (*ctx.global_style()).clone();
     style.text_styles = [
-        (TextStyle::Heading, FontId::new(22.0, Proportional)),
+        (TextStyle::Heading, FontId::new(20.0, Proportional)),
         (TextStyle::Body, FontId::new(15.0, Proportional)),
         (TextStyle::Monospace, FontId::new(14.0, egui::FontFamily::Monospace)),
         (TextStyle::Button, FontId::new(15.0, Proportional)),
@@ -630,15 +732,38 @@ fn configure_style(ctx: &egui::Context) {
     ]
     .into();
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-    style.spacing.button_padding = egui::vec2(10.0, 6.0);
-    style.spacing.interact_size.y = 28.0;
+    style.spacing.button_padding = egui::vec2(12.0, 7.0);
+    style.spacing.interact_size.y = 30.0;
 
     let mut v = egui::Visuals::dark();
     v.override_text_color = Some(C_TEXT);
-    v.panel_fill = Color32::from_rgb(24, 26, 31);
-    v.selection.bg_fill = Color32::from_rgba_unmultiplied(74, 142, 240, 90);
-    v.selection.stroke = egui::Stroke::new(1.0, C_ACCENT);
+    v.panel_fill = C_BG;
+    v.window_fill = C_CARD;
+    v.window_corner_radius = CornerRadius::same(10);
+    v.menu_corner_radius = CornerRadius::same(8);
+    v.selection.bg_fill = Color32::from_rgba_unmultiplied(74, 142, 240, 70);
+    v.selection.stroke = Stroke::new(1.0, C_ACCENT);
     v.hyperlink_color = C_ACCENT;
+
+    // Rounded widgets with layered fills (buttons paint with weak_bg_fill).
+    let cr = CornerRadius::same(7);
+    v.widgets.noninteractive.corner_radius = cr;
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(44, 48, 57));
+    v.widgets.inactive.corner_radius = cr;
+    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(44, 48, 57);
+    v.widgets.inactive.bg_fill = Color32::from_rgb(44, 48, 57);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(58, 63, 74));
+    v.widgets.hovered.corner_radius = cr;
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(58, 63, 74);
+    v.widgets.hovered.bg_fill = Color32::from_rgb(58, 63, 74);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, C_ACCENT);
+    v.widgets.hovered.expansion = 1.0;
+    v.widgets.active.corner_radius = cr;
+    v.widgets.active.weak_bg_fill = Color32::from_rgb(70, 76, 90);
+    v.widgets.active.bg_fill = Color32::from_rgb(70, 76, 90);
+    v.widgets.active.bg_stroke = Stroke::new(1.0, C_ACCENT);
+    v.widgets.open.corner_radius = cr;
+
     style.visuals = v;
     ctx.set_global_style(style);
 }
@@ -647,8 +772,10 @@ fn configure_style(ctx: &egui::Context) {
 pub fn run_gui(paths: Paths, config: Config) -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 660.0])
-            .with_min_inner_size([720.0, 480.0])
+            // Sized so the 8-column project grid fits without horizontal scroll at the
+            // default size; shrinking below this scrolls rather than clips.
+            .with_inner_size([1260.0, 740.0])
+            .with_min_inner_size([1000.0, 560.0])
             .with_icon(egui::IconData { rgba: icon::rgba(256, icon::BRAND), width: 256, height: 256 }),
         ..Default::default()
     };
