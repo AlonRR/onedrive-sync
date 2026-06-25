@@ -34,7 +34,7 @@ pub fn scan(project: &Project) -> Vec<PathBuf> {
 }
 
 /// True if `name` matches `conflict-<machine>-<8 digits>T…` (the rclone suffix).
-fn is_conflict_name(name: &str) -> bool {
+pub fn is_conflict_name(name: &str) -> bool {
     let Some(cpos) = name.find("conflict-") else { return false };
     let bytes = name.as_bytes();
     // Look for `-DDDDDDDDT` at or after the end of "conflict-".

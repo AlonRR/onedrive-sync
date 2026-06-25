@@ -98,6 +98,14 @@ impl Config {
         }
     }
 
+    /// Persist to config.toml (atomic, no BOM) so the GUI settings editor and the
+    /// next load agree. Discovery picks the change up on the next refresh/run.
+    pub fn save(&self, paths: &Paths) -> Result<()> {
+        let text = toml::to_string_pretty(self)?;
+        crate::jsonio::write_atomic(&paths.config_file(), &text);
+        Ok(())
+    }
+
     /// Project parents resolved to absolute paths under the OneDrive root.
     pub fn project_parent_paths(&self, paths: &Paths) -> Vec<PathBuf> {
         self.project_parents.iter().map(|r| paths.onedrive.join(r)).collect()

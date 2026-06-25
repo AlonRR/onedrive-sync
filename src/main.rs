@@ -244,7 +244,10 @@ fn dispatch(cmd: Cmd, paths: &Paths, config: &Config) -> Result<(), String> {
                 None => eprintln!("no project matching '{id}'"),
             }
         }
-        Cmd::Diag => write_diag(paths, config),
+        Cmd::Diag => match actions::diag(paths, config) {
+            Ok(p) => println!("Diagnostic bundle: {}", p.display()),
+            Err(e) => eprintln!("{e}"),
+        },
         Cmd::Gui => {
             ods::gui::run_gui(paths.clone(), config.clone()).map_err(|e| e.to_string())?;
         }
@@ -298,25 +301,3 @@ fn discover_interactive(paths: &Paths, config: &Config) {
     }
 }
 
-fn write_diag(paths: &Paths, config: &Config) {
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let temp = std::env::var("TEMP").unwrap_or_else(|_| ".".into());
-    let bundle = std::path::Path::new(&temp).join(format!("ods-diag-{stamp}.txt"));
-    let mut out = String::new();
-    out.push_str("# ods diagnostics — NOT redacted; contains full paths and recent log lines.\n");
-    out.push_str("=== config ===\n");
-    out.push_str(&serde_json::to_string_pretty(config).unwrap_or_default());
-    out.push_str("\n=== machine-state ===\n");
-    out.push_str(&serde_json::to_string_pretty(&MachineState::load(paths)).unwrap_or_default());
-    out.push_str("\n=== recent log ===\n");
-    if let Ok(text) = std::fs::read_to_string(paths.log_file()) {
-        let tail: Vec<&str> = text.lines().rev().take(200).collect();
-        for l in tail.iter().rev() {
-            out.push_str(l);
-            out.push('\n');
-        }
-    }
-    if std::fs::write(&bundle, out).is_ok() {
-        println!("Diagnostic bundle: {}", bundle.display());
-    }
-}

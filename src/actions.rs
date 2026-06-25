@@ -161,6 +161,45 @@ pub fn list_conflicts(paths: &Paths, config: &Config) -> Vec<(String, Vec<PathBu
     out
 }
 
+/// Delete one rclone conflict copy. Guarded: the path must still be a file and its
+/// name must match the conflict-copy pattern, so an ordinary file can't be removed.
+pub fn delete_conflict(paths: &Paths, file: &Path) -> Result<(), String> {
+    if !file.is_file() {
+        return Err("Not a file (already gone?).".into());
+    }
+    let name = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    if !conflicts::is_conflict_name(&name) {
+        return Err("Refusing: not a recognised conflict-copy filename.".into());
+    }
+    std::fs::remove_file(file).map_err(|e| e.to_string())?;
+    events::log(paths, "INFO", &format!("Deleted conflict copy {}", file.display()));
+    Ok(())
+}
+
+/// Write a diagnostic bundle (config + machine-state + recent log tail) to %TEMP%
+/// and return its path. NOT redacted — contains full paths and log lines.
+pub fn diag(paths: &Paths, config: &Config) -> Result<PathBuf, String> {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let temp = std::env::var("TEMP").unwrap_or_else(|_| ".".into());
+    let bundle = Path::new(&temp).join(format!("ods-diag-{stamp}.txt"));
+    let mut out = String::new();
+    out.push_str("# ods diagnostics — NOT redacted; contains full paths and recent log lines.\n");
+    out.push_str("=== config ===\n");
+    out.push_str(&serde_json::to_string_pretty(config).unwrap_or_default());
+    out.push_str("\n=== machine-state ===\n");
+    out.push_str(&serde_json::to_string_pretty(&MachineState::load(paths)).unwrap_or_default());
+    out.push_str("\n=== recent log ===\n");
+    if let Ok(text) = std::fs::read_to_string(paths.log_file()) {
+        let tail: Vec<&str> = text.lines().rev().take(200).collect();
+        for l in tail.iter().rev() {
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    std::fs::write(&bundle, out).map_err(|e| e.to_string())?;
+    Ok(bundle)
+}
+
 /// Pause the scheduled sync (the flag file the run loop honors; authoritative and
 /// elevation-free). Best-effort also disables the task so it doesn't even spawn.
 pub fn pause(paths: &Paths) {
@@ -209,6 +248,38 @@ fn parse_at(at: &str) -> Option<NaiveDateTime> {
     chrono::NaiveDate::parse_from_str(at, "%Y-%m-%d")
         .ok()
         .and_then(|d| d.and_hms_opt(23, 59, 59))
+}
+
+/// One restorable run from the local version archive.
+#[derive(Clone)]
+pub struct ArchiveRun {
+    /// A parse_at-compatible timestamp ("YYYY-MM-DD HH:MM:SS") to pass to `restore`.
+    pub at: String,
+    /// Human label for the list (with a "(seed)" marker for the initial seed run).
+    pub label: String,
+}
+
+/// List restorable archive runs for a project, newest first (excludes pre-restore
+/// backups). Empty if the project has no local versions yet.
+pub fn archive_runs(paths: &Paths, id: &str) -> Vec<ArchiveRun> {
+    let base = paths.versions_dir().join(engine::id_hash(id));
+    let Ok(rd) = std::fs::read_dir(&base) else { return vec![] };
+    let mut runs: Vec<(NaiveDateTime, bool)> = rd
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|e| !e.file_name().to_string_lossy().starts_with("pre-restore-"))
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            run_stamp(&name).map(|s| (s, name.starts_with("seed-")))
+        })
+        .collect();
+    runs.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    runs.into_iter()
+        .map(|(dt, seed)| ArchiveRun {
+            at: dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            label: format!("{}{}", dt.format("%Y-%m-%d %H:%M"), if seed { "  (seed)" } else { "" }),
+        })
+        .collect()
 }
 
 pub fn restore(

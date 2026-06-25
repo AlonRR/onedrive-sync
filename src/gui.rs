@@ -45,6 +45,32 @@ enum View {
     Pending,
     Retired,
     AddWatch,
+    Settings,
+}
+
+/// A pending destructive action awaiting a second (confirm) click.
+enum Confirm {
+    Restore { id: String, at: String, label: String },
+    DeleteConflict { id: String, path: PathBuf },
+    UnmapDeleteLocal { id: String },
+}
+
+/// Editable buffers for the Settings view (string-backed so partial edits are kept).
+#[derive(Default)]
+struct SettingsForm {
+    loaded: bool,
+    compare: String,
+    max_delete: String,
+    retention_days: String,
+    max_gb: String,
+    transfers: String,
+    time_budget: String,
+    idle_stability: String,
+    project_parents: String,
+    watch_roots: String,
+    exclude_dirs: String,
+    exclude_files: String,
+    sync_anyway: String,
 }
 
 struct Row {
@@ -85,6 +111,12 @@ struct GuiApp {
     watch_local: String,
     watch_dest: String,
     conflict_view: Option<(String, Vec<PathBuf>)>,
+    restore_runs: Option<Vec<actions::ArchiveRun>>,
+    filter_text: Option<String>,
+    confirm: Option<Confirm>,
+    unmap_delete_local: bool,
+    approve_deletes: bool,
+    settings: SettingsForm,
     filter: String,
     zoom: f32,
     logo: Option<egui::TextureHandle>,
@@ -107,6 +139,25 @@ fn primary(text: &str) -> egui::Button<'static> {
 /// exit code even on success, so we never inspect the result.)
 fn open_in_explorer(path: &Path) {
     let _ = std::process::Command::new("explorer").arg(path).spawn();
+}
+
+/// Reveal (select) a single file in Explorer, fire-and-forget.
+fn reveal_in_explorer(file: &Path) {
+    let _ = std::process::Command::new("explorer").arg(format!("/select,{}", file.display())).spawn();
+}
+
+/// A copy of `c` with the delete-brake lifted to 100% when "approve deletes" is on.
+fn approve_cfg(c: &Config, approve: bool) -> Config {
+    let mut c = c.clone();
+    if approve {
+        c.max_delete_percent = 100;
+    }
+    c
+}
+
+/// Split a multiline editor buffer into trimmed, non-empty lines.
+fn lines_to_vec(s: &str) -> Vec<String> {
+    s.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).map(String::from).collect()
 }
 
 /// Format an ISO-8601 timestamp as a coarse "Nm ago" age.
@@ -182,6 +233,12 @@ impl GuiApp {
             watch_local: String::new(),
             watch_dest: String::new(),
             conflict_view: None,
+            restore_runs: None,
+            filter_text: None,
+            confirm: None,
+            unmap_delete_local: false,
+            approve_deletes: false,
+            settings: SettingsForm::default(),
             filter: String::new(),
             zoom: 1.0,
             logo: None,
@@ -237,6 +294,10 @@ impl GuiApp {
         self.sel_compare = self.state.compare.get(id).cloned().unwrap_or_else(|| self.config.compare_mode.clone());
         self.sel_maxdelete = self.state.max_delete.get(id).map(|n| n.to_string()).unwrap_or_default();
         self.conflict_view = None;
+        self.restore_runs = None;
+        self.filter_text = None;
+        self.confirm = None;
+        self.unmap_delete_local = false;
     }
 
     /// Local + OneDrive paths for a project id (re-discovered on demand, click-time only).
@@ -270,6 +331,15 @@ impl GuiApp {
         self.zoom = z.clamp(0.8, 1.8);
         ctx.set_zoom_factor(self.zoom);
     }
+
+    /// Start a full run (sync or dry-run) honouring the "approve deletes" toggle.
+    fn run_all(&mut self, msg: &str, dry: bool) {
+        let approve = self.approve_deletes;
+        self.run_job(msg, move |p, c| {
+            let cfg = approve_cfg(c, approve);
+            run(p, &cfg, RunOpts { dry_run: dry, ignore_pause: true })
+        });
+    }
 }
 
 impl eframe::App for GuiApp {
@@ -294,7 +364,7 @@ impl eframe::App for GuiApp {
         }
         while TrayIconEvent::receiver().try_recv().is_ok() {}
         if want_sync {
-            self.run_job("syncing all…", |p, c| run(p, c, RunOpts { dry_run: false, ignore_pause: true }));
+            self.run_all("syncing all…", false);
         }
         if let Some(rx) = &self.rx {
             if let Ok(result) = rx.try_recv() {
@@ -331,6 +401,7 @@ impl eframe::App for GuiApp {
                 View::Pending => self.view_pending(ui),
                 View::Retired => self.view_retired(ui),
                 View::AddWatch => self.view_add_watch(ui),
+                View::Settings => self.view_settings(ui),
             });
         });
     }
@@ -370,14 +441,16 @@ impl GuiApp {
                 ui.separator();
                 // Global run actions.
                 if ui.add_enabled(!self.busy, primary("Sync all")).on_hover_text("Sync every active project now").clicked() {
-                    self.run_job("syncing all…", |p, c| run(p, c, RunOpts { dry_run: false, ignore_pause: true }));
+                    self.run_all("syncing all…", false);
                 }
                 if ui.add_enabled(!self.busy, egui::Button::new("Dry-run all")).on_hover_text("Preview every active project; changes nothing").clicked() {
-                    self.run_job("previewing…", |p, c| run(p, c, RunOpts { dry_run: true, ignore_pause: true }));
+                    self.run_all("previewing…", true);
                 }
                 if ui.button("Refresh").clicked() {
                     self.refresh();
                 }
+                ui.add(egui::Checkbox::new(&mut self.approve_deletes, "Approve deletes"))
+                    .on_hover_text("Lift the delete-brake to 100% for runs started here (allows mass deletions)");
             });
         });
     }
@@ -391,6 +464,7 @@ impl GuiApp {
         self.nav_item(ui, View::Pending, plabel);
         self.nav_item(ui, View::Retired, "Retired".to_string());
         self.nav_item(ui, View::AddWatch, "Add watch".to_string());
+        self.nav_item(ui, View::Settings, "Settings".to_string());
     }
 
     fn nav_item(&mut self, ui: &mut egui::Ui, view: View, label: String) {
@@ -521,17 +595,23 @@ impl GuiApp {
         if self.selected.is_none() {
             return;
         }
+
+        // Pending destructive action: show a prominent confirm bar (two-click safety).
+        self.confirm_bar(ui);
+
         ui.add_space(8.0);
 
         // Primary actions: sync / resync / open folders.
         ui.horizontal(|ui| {
             if ui.add_enabled(!self.busy, primary("Sync")).on_hover_text("Sync this project now").clicked() {
                 let pid = id.clone();
+                let approve = self.approve_deletes;
                 self.run_job(&format!("syncing {pid}…"), move |p, c| {
+                    let cfg = approve_cfg(c, approve);
                     let st = MachineState::load(p);
-                    let list = discover(p, c, &Catalog::load(p));
+                    let list = discover(p, &cfg, &Catalog::load(p));
                     match list.iter().find(|x| x.id == pid) {
-                        Some(proj) => { let (s, _) = crate::run::sync_project(p, c, &st, proj, false, false); format!("{pid}: {s}") }
+                        Some(proj) => { let (s, _) = crate::run::sync_project(p, &cfg, &st, proj, false, false); format!("{pid}: {s}") }
                         None => format!("no project '{pid}'"),
                     }
                 });
@@ -580,14 +660,35 @@ impl GuiApp {
         ui.separator();
         ui.add_space(8.0);
 
-        // Lifecycle actions.
+        // Inspect: conflicts / generated filter / version history (each a toggle).
         ui.horizontal(|ui| {
-            if ui.button("View conflicts").clicked() {
-                let list = discover(&self.paths, &self.config, &Catalog::load(&self.paths));
-                if let Some(p) = list.iter().find(|p| p.id == id) {
-                    self.conflict_view = Some((id.clone(), conflicts::scan(p)));
+            if ui.button("View conflicts").on_hover_text("List unresolved rclone conflict copies").clicked() {
+                if self.conflict_view.is_some() {
+                    self.conflict_view = None;
+                } else if let Some(p) = self.find_project(&id) {
+                    self.conflict_view = Some((id.clone(), conflicts::scan(&p)));
                 }
             }
+            if ui.button("Show filter").on_hover_text("Show the generated rclone filter for this project").clicked() {
+                if self.filter_text.is_some() {
+                    self.filter_text = None;
+                } else if let Some(p) = self.find_project(&id) {
+                    self.filter_text = Some(crate::filter::generate(&p, &self.config));
+                }
+            }
+            if ui.button("Versions…").on_hover_text("Restore this project from a local archived version").clicked() {
+                if self.restore_runs.is_some() {
+                    self.restore_runs = None;
+                } else {
+                    self.restore_runs = Some(actions::archive_runs(&self.paths, &id));
+                }
+            }
+        });
+
+        ui.add_space(8.0);
+
+        // Lifecycle actions.
+        ui.horizontal(|ui| {
             if ui.add_enabled(!self.busy, egui::Button::new("Pull")).on_hover_text("Activate + sync here").clicked() {
                 let pid = id.clone();
                 self.run_job(&format!("pulling {pid}…"), move |p, c| match actions::pull(p, c, &pid) {
@@ -595,14 +696,20 @@ impl GuiApp {
                     Err(e) => e,
                 });
             }
-            if ui.button("Unmap").on_hover_text("Stop syncing here; keep the OneDrive copy").clicked() {
-                match actions::unmap(&self.paths, &self.config, &id, false) {
-                    Ok(()) => self.status_msg = format!("unmapped {id}"),
-                    Err(e) => self.status_msg = e,
+            if ui.button("Unmap").on_hover_text("Stop syncing here").clicked() {
+                if self.unmap_delete_local {
+                    self.confirm = Some(Confirm::UnmapDeleteLocal { id: id.clone() });
+                } else {
+                    match actions::unmap(&self.paths, &self.config, &id, false) {
+                        Ok(()) => self.status_msg = format!("unmapped {id} (OneDrive copy kept)"),
+                        Err(e) => self.status_msg = e,
+                    }
+                    self.selected = None;
+                    self.refresh();
                 }
-                self.selected = None;
-                self.refresh();
             }
+            ui.checkbox(&mut self.unmap_delete_local, "delete local too")
+                .on_hover_text("Also remove the local folder on Unmap (refused on a protected root)");
             if ui.button(RichText::new("Forget").color(C_ATTENTION)).on_hover_text("Retire globally (tombstone); reversible with Pull").clicked() {
                 actions::forget(&self.paths, &id);
                 self.status_msg = format!("forgot {id}");
@@ -611,17 +718,148 @@ impl GuiApp {
             }
         });
 
-        if let Some((cid, files)) = self.conflict_view.clone() {
-            ui.add_space(8.0);
-            ui.label(RichText::new(format!("Conflicts in {cid}:")).strong());
-            if files.is_empty() {
-                ui.label(RichText::new("  (none)").color(C_DIM));
-            } else {
-                for f in files {
-                    ui.monospace(f.display().to_string());
+        self.conflict_section(ui);
+        self.restore_section(ui, &id);
+        self.filter_section(ui);
+    }
+
+    /// The two-click confirm bar for a pending destructive action.
+    fn confirm_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(c) = &self.confirm else { return };
+        let msg = match c {
+            Confirm::Restore { label, .. } => format!("Restore from {label}? This overwrites the local copy (a backup is taken first)."),
+            Confirm::DeleteConflict { path, .. } => format!("Delete conflict copy '{}'?", path.file_name().unwrap_or_default().to_string_lossy()),
+            Confirm::UnmapDeleteLocal { id } => format!("Unmap {id} AND delete the local folder? The OneDrive copy is kept."),
+        };
+        let mut go = false;
+        let mut cancel = false;
+        ui.add_space(8.0);
+        let warn = egui::Frame::default()
+            .fill(Color32::from_rgb(64, 38, 38))
+            .inner_margin(egui::Margin::same(10))
+            .corner_radius(egui::CornerRadius::same(6));
+        warn.show(ui, |ui| {
+            ui.label(RichText::new(&msg).color(C_TEXT).strong());
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(RichText::new("Confirm").color(Color32::WHITE)).fill(C_ATTENTION)).clicked() {
+                    go = true;
                 }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if cancel {
+            self.confirm = None;
+        }
+        if go {
+            if let Some(c) = self.confirm.take() {
+                self.dispatch_confirm(c);
             }
         }
+    }
+
+    fn dispatch_confirm(&mut self, c: Confirm) {
+        match c {
+            Confirm::Restore { id, at, label } => {
+                self.run_job(&format!("restoring {id}…"), move |p, cfg| match actions::restore(p, cfg, &id, Some(&at), None) {
+                    Ok(()) => format!("restored {id} from {label}"),
+                    Err(e) => e,
+                });
+            }
+            Confirm::DeleteConflict { id, path } => {
+                match actions::delete_conflict(&self.paths, &path) {
+                    Ok(()) => self.status_msg = format!("deleted conflict copy in {id}"),
+                    Err(e) => self.status_msg = e,
+                }
+                if let Some(p) = self.find_project(&id) {
+                    self.conflict_view = Some((id.clone(), conflicts::scan(&p)));
+                }
+                self.refresh();
+            }
+            Confirm::UnmapDeleteLocal { id } => {
+                match actions::unmap(&self.paths, &self.config, &id, true) {
+                    Ok(()) => self.status_msg = format!("unmapped {id} and deleted local"),
+                    Err(e) => self.status_msg = e,
+                }
+                self.selected = None;
+                self.refresh();
+            }
+        }
+    }
+
+    /// Conflict list with per-file open/delete (delete goes through the confirm bar).
+    fn conflict_section(&mut self, ui: &mut egui::Ui) {
+        let Some((cid, files)) = self.conflict_view.clone() else { return };
+        ui.add_space(8.0);
+        ui.label(RichText::new(format!("Conflicts in {cid}:")).strong());
+        if files.is_empty() {
+            ui.label(RichText::new("  (none)").color(C_DIM));
+            return;
+        }
+        let mut del: Option<PathBuf> = None;
+        egui::ScrollArea::vertical().max_height(150.0).id_salt("conflicts").show(ui, |ui| {
+            for f in &files {
+                ui.horizontal(|ui| {
+                    if ui.button("Open").on_hover_text("Reveal in Explorer").clicked() {
+                        reveal_in_explorer(f);
+                    }
+                    if ui.button(RichText::new("Delete").color(C_ATTENTION)).clicked() {
+                        del = Some(f.clone());
+                    }
+                    ui.monospace(f.display().to_string());
+                });
+            }
+        });
+        if let Some(path) = del {
+            self.confirm = Some(Confirm::DeleteConflict { id: cid, path });
+        }
+    }
+
+    /// Archived-version list; choosing one stages a restore in the confirm bar.
+    fn restore_section(&mut self, ui: &mut egui::Ui, id: &str) {
+        let Some(runs) = self.restore_runs.clone() else { return };
+        ui.add_space(8.0);
+        ui.label(RichText::new("Restore from a local archived version:").strong());
+        if runs.is_empty() {
+            ui.label(RichText::new("  (no archived versions yet — try OneDrive version history)").color(C_DIM));
+            return;
+        }
+        let mut pick: Option<(String, String)> = None;
+        egui::ScrollArea::vertical().max_height(150.0).id_salt("versions").show(ui, |ui| {
+            for r in &runs {
+                ui.horizontal(|ui| {
+                    if ui.button("Restore").clicked() {
+                        pick = Some((r.at.clone(), r.label.clone()));
+                    }
+                    ui.label(&r.label);
+                });
+            }
+        });
+        if let Some((at, label)) = pick {
+            self.confirm = Some(Confirm::Restore { id: id.to_string(), at, label });
+        }
+    }
+
+    fn filter_section(&mut self, ui: &mut egui::Ui) {
+        let Some(text) = self.filter_text.clone() else { return };
+        ui.add_space(8.0);
+        ui.label(RichText::new("Generated rclone filter:").strong());
+        egui::ScrollArea::vertical().max_height(150.0).id_salt("filter").show(ui, |ui| {
+            let mut t = text;
+            ui.add(
+                egui::TextEdit::multiline(&mut t)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY)
+                    .interactive(false),
+            );
+        });
+    }
+
+    /// Re-discover and find the selected project (click-time only).
+    fn find_project(&self, id: &str) -> Option<crate::discovery::Project> {
+        discover(&self.paths, &self.config, &Catalog::load(&self.paths)).into_iter().find(|p| p.id == id)
     }
 
     fn view_pending(&mut self, ui: &mut egui::Ui) {
@@ -714,6 +952,171 @@ impl GuiApp {
                     Err(e) => self.status_msg = e,
                 }
             }
+        }
+    }
+
+    fn view_settings(&mut self, ui: &mut egui::Ui) {
+        if !self.settings.loaded {
+            self.load_settings();
+        }
+        ui.heading("Settings");
+        ui.label(RichText::new(r"Edits write %LOCALAPPDATA%\onedrive-sync\config.toml; discovery picks them up on the next refresh.").color(C_DIM).small());
+        ui.add_space(10.0);
+
+        egui::Grid::new("set-paths").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+            for (k, v) in [
+                ("Local root", self.paths.local_root.display().to_string()),
+                ("OneDrive", self.paths.onedrive.display().to_string()),
+                ("Profile", self.paths.user_profile.display().to_string()),
+            ] {
+                ui.label(RichText::new(k).color(C_DIM));
+                ui.monospace(v);
+                ui.end_row();
+            }
+        });
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label(RichText::new("Sync defaults").strong());
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Compare:");
+            egui::ComboBox::from_id_salt("set-compare").selected_text(&self.settings.compare).show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.settings.compare, "modtime".to_string(), "modtime (fast)");
+                ui.selectable_value(&mut self.settings.compare, "checksum".to_string(), "checksum (exact)");
+            });
+            ui.add_space(10.0);
+            ui.label("Max-delete %:");
+            ui.add(egui::TextEdit::singleline(&mut self.settings.max_delete).desired_width(54.0));
+            ui.add_space(10.0);
+            ui.label("Transfers:");
+            ui.add(egui::TextEdit::singleline(&mut self.settings.transfers).desired_width(46.0));
+            ui.add_space(10.0);
+            ui.label("Run budget (s):");
+            ui.add(egui::TextEdit::singleline(&mut self.settings.time_budget).desired_width(62.0));
+            ui.add_space(10.0);
+            ui.label("Idle gate (s):");
+            ui.add(egui::TextEdit::singleline(&mut self.settings.idle_stability).desired_width(54.0));
+        });
+
+        ui.add_space(8.0);
+        ui.label(RichText::new("Versioning").strong());
+        ui.horizontal(|ui| {
+            ui.label("Retention (days):");
+            ui.add(egui::TextEdit::singleline(&mut self.settings.retention_days).desired_width(54.0));
+            ui.add_space(12.0);
+            ui.label("Archive cap (GB):");
+            ui.add(egui::TextEdit::singleline(&mut self.settings.max_gb).desired_width(54.0));
+        });
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label(RichText::new("Discovery roots (one per line)").strong());
+        egui::Grid::new("set-roots").num_columns(2).spacing([14.0, 6.0]).show(ui, |ui| {
+            ui.label("Project parents (under OneDrive):");
+            ui.add(egui::TextEdit::multiline(&mut self.settings.project_parents).desired_rows(2).desired_width(360.0));
+            ui.end_row();
+            ui.label("Watch roots (under profile):");
+            ui.add(egui::TextEdit::multiline(&mut self.settings.watch_roots).desired_rows(2).desired_width(360.0));
+            ui.end_row();
+        });
+
+        ui.add_space(8.0);
+        ui.collapsing("Filters (advanced)", |ui| {
+            egui::Grid::new("set-filters").num_columns(2).spacing([14.0, 6.0]).show(ui, |ui| {
+                ui.label("Exclude dirs:");
+                ui.add(egui::TextEdit::multiline(&mut self.settings.exclude_dirs).desired_rows(3).desired_width(360.0));
+                ui.end_row();
+                ui.label("Exclude files:");
+                ui.add(egui::TextEdit::multiline(&mut self.settings.exclude_files).desired_rows(3).desired_width(360.0));
+                ui.end_row();
+                ui.label("Sync anyway (force-include):");
+                ui.add(egui::TextEdit::multiline(&mut self.settings.sync_anyway).desired_rows(2).desired_width(360.0));
+                ui.end_row();
+            });
+        });
+
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui.add(primary("Save settings")).clicked() {
+                self.save_settings();
+            }
+            if ui.button("Reload").on_hover_text("Discard edits and reload from disk").clicked() {
+                self.settings.loaded = false;
+            }
+        });
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label(RichText::new("Maintenance").strong());
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Write diagnostics").on_hover_text("Write a diagnostic bundle to %TEMP% and reveal it").clicked() {
+                match actions::diag(&self.paths, &self.config) {
+                    Ok(p) => { self.status_msg = format!("diagnostics: {}", p.display()); reveal_in_explorer(&p); }
+                    Err(e) => self.status_msg = e,
+                }
+            }
+            if ui.button("Open config file").clicked() {
+                let cf = self.paths.config_file();
+                if cf.exists() { reveal_in_explorer(&cf); } else { open_in_explorer(&self.paths.local_root); }
+            }
+            if ui.button("Open log folder").clicked() {
+                open_in_explorer(&self.paths.logs_dir());
+            }
+            if ui.button("Open state folder").clicked() {
+                open_in_explorer(&self.paths.local_root);
+            }
+        });
+    }
+
+    fn load_settings(&mut self) {
+        let c = &self.config;
+        self.settings = SettingsForm {
+            loaded: true,
+            compare: c.compare_mode.clone(),
+            max_delete: c.max_delete_percent.to_string(),
+            retention_days: c.version_retention_days.to_string(),
+            max_gb: c.version_max_gb.to_string(),
+            transfers: c.rclone_transfers.to_string(),
+            time_budget: c.run_time_budget.to_string(),
+            idle_stability: c.idle_stability_seconds.to_string(),
+            project_parents: c.project_parents.join("\n"),
+            watch_roots: c.watch_roots.join("\n"),
+            exclude_dirs: c.exclude_dirs.join("\n"),
+            exclude_files: c.exclude_files.join("\n"),
+            sync_anyway: c.sync_anyway.join("\n"),
+        };
+    }
+
+    fn save_settings(&mut self) {
+        let mut c = self.config.clone();
+        {
+            let s = &self.settings;
+            if !s.compare.trim().is_empty() {
+                c.compare_mode = s.compare.trim().to_string();
+            }
+            if let Ok(v) = s.max_delete.trim().parse() { c.max_delete_percent = v; }
+            if let Ok(v) = s.retention_days.trim().parse() { c.version_retention_days = v; }
+            if let Ok(v) = s.max_gb.trim().parse() { c.version_max_gb = v; }
+            if let Ok(v) = s.transfers.trim().parse() { c.rclone_transfers = v; }
+            if let Ok(v) = s.time_budget.trim().parse() { c.run_time_budget = v; }
+            if let Ok(v) = s.idle_stability.trim().parse() { c.idle_stability_seconds = v; }
+            c.project_parents = lines_to_vec(&s.project_parents);
+            c.watch_roots = lines_to_vec(&s.watch_roots);
+            c.exclude_dirs = lines_to_vec(&s.exclude_dirs);
+            c.exclude_files = lines_to_vec(&s.exclude_files);
+            c.sync_anyway = lines_to_vec(&s.sync_anyway);
+        }
+        match c.save(&self.paths) {
+            Ok(()) => {
+                self.config = c;
+                self.settings.loaded = false; // re-read normalised values next frame
+                self.status_msg = "settings saved".into();
+                self.refresh();
+            }
+            Err(e) => self.status_msg = format!("save failed: {e}"),
         }
     }
 }
