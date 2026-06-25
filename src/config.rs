@@ -116,3 +116,27 @@ impl Config {
         self.watch_roots.iter().map(|r| paths.user_profile.join(r)).collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Settings editor serializes the whole Config to TOML. `plain_folders` is a
+    /// TOML array-of-tables, which must appear AFTER all scalar keys — guard that a
+    /// NON-EMPTY plain_folders still round-trips (an empty one hides the problem).
+    #[test]
+    fn config_with_plain_folders_round_trips_through_toml() {
+        let mut c = Config::default();
+        c.plain_folders = vec![
+            PlainFolder { local: r"C:\Users\me\notes".into(), dest: r"C:\Users\me\OneDrive\notes".into() },
+            PlainFolder { local: r"C:\Users\me\docs".into(), dest: r"C:\Users\me\OneDrive\docs".into() },
+        ];
+        c.max_delete_percent = 33;
+        let text = toml::to_string_pretty(&c).expect("serialize Config to TOML");
+        let back: Config = toml::from_str(&text).expect("re-parse Config from TOML");
+        assert_eq!(back.plain_folders.len(), 2);
+        assert_eq!(back.plain_folders[0].dest, r"C:\Users\me\OneDrive\notes");
+        assert_eq!(back.max_delete_percent, 33);
+        assert_eq!(back.project_parents, c.project_parents);
+    }
+}

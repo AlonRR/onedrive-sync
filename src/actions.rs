@@ -377,3 +377,46 @@ fn copy_path(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_paths(tag: &str) -> Paths {
+        let base = std::env::temp_dir().join(format!("ods-test-{}-{tag}", std::process::id()));
+        Paths { local_root: base.clone(), onedrive: base.clone(), user_profile: base }
+    }
+
+    #[test]
+    fn delete_conflict_removes_only_conflict_named_files() {
+        let p = temp_paths("dc");
+        let dir = p.local_root.join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conflict = dir.join("app.conflict-PC-20260101T000000.txt");
+        let ordinary = dir.join("app.txt");
+        std::fs::write(&conflict, b"x").unwrap();
+        std::fs::write(&ordinary, b"y").unwrap();
+
+        // Refuses an ordinary file (guard), leaving it in place.
+        assert!(delete_conflict(&p, &ordinary).is_err());
+        assert!(ordinary.exists(), "ordinary file must be untouched");
+
+        // Deletes a real rclone conflict copy.
+        assert!(delete_conflict(&p, &conflict).is_ok());
+        assert!(!conflict.exists());
+
+        let _ = std::fs::remove_dir_all(&p.local_root);
+    }
+
+    #[test]
+    fn restore_at_string_round_trips() {
+        // archive_runs emits "%Y-%m-%d %H:%M:%S"; restore selects via parse_at on it,
+        // so the two must agree on the format (the linchpin of GUI restore).
+        let s = "2026-06-24 15:30:00";
+        assert!(parse_at(s).is_some(), "restore must parse the timestamp archive_runs produces");
+        // run_stamp parses the archive dir name; both must land on the same instant.
+        let from_dir = run_stamp("20260624T153000Z").expect("run dir name parses");
+        assert_eq!(from_dir.format("%Y-%m-%d %H:%M:%S").to_string(), s);
+        assert_eq!(parse_at(s), Some(from_dir));
+    }
+}
