@@ -31,14 +31,17 @@ if ($FromRelease -or $Version) {
 }
 $dir = Join-Path $env:LOCALAPPDATA 'ods'
 New-Item -ItemType Directory -Force $dir | Out-Null
+
+# Stop a running tray FIRST — it holds a lock on ods-gui.exe at the destination, so a
+# re-install/redeploy can't overwrite it otherwise. Then copy the fresh binaries.
+Get-Process ods-gui -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Copy-Item (Join-Path $src 'ods.exe')     $dir -Force
 Copy-Item (Join-Path $src 'ods-gui.exe') $dir -Force
 $odsExe = Join-Path $dir 'ods.exe'
 $guiExe = Join-Path $dir 'ods-gui.exe'
 Write-Host "installed -> $dir" -ForegroundColor Green
 
-# Bring up the tray now (no scheduling needed for this).
-Get-Process ods-gui -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+# Bring the tray back up (no scheduling needed for this).
 Start-Process $guiExe
 Write-Host "tray launched ($guiExe)" -ForegroundColor Green
 
@@ -61,17 +64,33 @@ if (-not $canSwap) {
 $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $prin = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 
+# Register a task, but on a redeploy SKIP the -Force replace when an existing task
+# already runs the right exe — replacing a running task needs elevation and would
+# fail with "Access is denied", even though nothing needed to change.
+function Register-OdsTask($name, $task, $wantExe, $note) {
+    $have = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+    if ($have -and $have.Actions[0].Execute -eq $wantExe) {
+        if ($have.State -eq 'Disabled') { Enable-ScheduledTask -TaskName $name | Out-Null }
+        Write-Host "$name already current ($note)" -ForegroundColor Green
+        return
+    }
+    try {
+        Register-ScheduledTask -TaskName $name -Force -InputObject $task -ErrorAction Stop | Out-Null
+        Write-Host "registered $name ($note)" -ForegroundColor Green
+    } catch {
+        Write-Warning "could not register $name ($($_.Exception.Message.Trim())) — re-run elevated to update it"
+    }
+}
+
 $a1 = New-ScheduledTaskAction -Execute $odsExe -Argument 'sync'
 $tL = New-ScheduledTaskTrigger -AtLogOn
 $tR = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 30) -RepetitionDuration (New-TimeSpan -Days 3650)
 $s1 = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -RunOnlyIfNetworkAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 60)
-Register-ScheduledTask -TaskName 'ods-sync' -Force -InputObject (New-ScheduledTask -Action $a1 -Trigger @($tL, $tR) -Settings $s1 -Principal $prin) | Out-Null
-Write-Host "registered ods-sync (logon + every 30 min)" -ForegroundColor Green
+Register-OdsTask 'ods-sync' (New-ScheduledTask -Action $a1 -Trigger @($tL, $tR) -Settings $s1 -Principal $prin) $odsExe 'logon + every 30 min'
 
 $a2 = New-ScheduledTaskAction -Execute $guiExe
 $s2 = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable
-Register-ScheduledTask -TaskName 'ods-tray' -Force -InputObject (New-ScheduledTask -Action $a2 -Trigger (New-ScheduledTaskTrigger -AtLogOn) -Settings $s2 -Principal $prin) | Out-Null
-Write-Host "registered ods-tray (logon)" -ForegroundColor Green
+Register-OdsTask 'ods-tray' (New-ScheduledTask -Action $a2 -Trigger (New-ScheduledTaskTrigger -AtLogOn) -Settings $s2 -Principal $prin) $guiExe 'logon'
 
 Write-Host ""
 Write-Host "ods is LIVE. PowerShell tasks disabled (not deleted). Roll back: scripts\uninstall.ps1" -ForegroundColor Green
