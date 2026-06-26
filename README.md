@@ -10,7 +10,32 @@ re-parse overhead.
 projects, generates per-repo filters, runs bisync with a delete-brake and a git health
 check, and surfaces state in a native window + tray.
 
-## Build
+## Install (no build)
+
+Prebuilt Windows binaries ship on every
+[Release](https://github.com/AlonRR/onedrive-sync/releases). To install the latest and
+register the scheduled sync + tray — no clone, no toolchain:
+
+```powershell
+irm https://raw.githubusercontent.com/AlonRR/onedrive-sync/main/scripts/get.ps1 | iex
+```
+
+Or, from a clone, install prebuilt binaries instead of building:
+
+```powershell
+scripts\install.ps1 -FromRelease          # latest release
+scripts\install.ps1 -Version v0.1.0        # a specific release
+```
+
+Either way `ods.exe` + `ods-gui.exe` land in `%LOCALAPPDATA%\ods`, the tray starts, and
+the `ods-sync` (logon + every 30 min) and `ods-tray` (logon) tasks are registered. Roll
+back with `scripts\uninstall.ps1`. `rclone` + `git` still need to be on the machine.
+
+**Cutting a release:** `.github/workflows/release.yml` builds the binaries and publishes a
+Release on any `v*.*.*` tag — `git tag v0.1.0 && git push origin v0.1.0`. (Publish to
+winget afterward with `wingetcreate` against the new release assets, if desired.)
+
+## Build from source
 
 ```sh
 cargo build --release      # -> target/release/ods.exe (~10 MB, self-contained)

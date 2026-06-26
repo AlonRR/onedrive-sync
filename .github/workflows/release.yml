@@ -1,0 +1,63 @@
+name: release
+
+# Build the Windows binaries and publish a GitHub Release whenever a version tag
+# (v0.1.0, v1.2.3, …) is pushed. The `v*.*.*` pattern deliberately does NOT match
+# the historical `v1.0-powershell` tag. Can also be run manually for an existing tag.
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build a release for, e.g. v0.1.0'
+        required: true
+
+permissions:
+  contents: write   # needed to create the Release and upload assets
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Install Rust (stable MSVC)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Stage artifacts (+ SHA256)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/ods.exe, target/release/ods-gui.exe dist/
+          foreach ($f in 'ods.exe', 'ods-gui.exe') {
+            (Get-FileHash "dist/$f" -Algorithm SHA256).Hash | Out-File "dist/$f.sha256" -Encoding ascii
+          }
+
+      - name: Publish / update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tag = '${{ github.event.inputs.tag || github.ref_name }}'
+          $assets = 'dist/ods.exe', 'dist/ods-gui.exe', 'dist/ods.exe.sha256', 'dist/ods-gui.exe.sha256'
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title "ods $tag" --generate-notes @assets
+          } else {
+            gh release upload $tag @assets --clobber
+          }

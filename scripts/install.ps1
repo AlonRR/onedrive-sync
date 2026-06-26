@@ -8,8 +8,27 @@
   the swap if it can't — leaving the PowerShell sync live. If that happens,
   re-run this script from an ELEVATED shell to finish the swap.
 #>
+param(
+    # Install prebuilt binaries from a GitHub Release instead of building from source.
+    [switch]$FromRelease,
+    # A specific release tag (e.g. v0.1.0); implies -FromRelease. Default: the latest release.
+    [string]$Version
+)
 $ErrorActionPreference = 'Stop'
-$src = Resolve-Path (Join-Path $PSScriptRoot '..\target\release')
+
+$repo = 'AlonRR/onedrive-sync'
+if ($FromRelease -or $Version) {
+    $base = if ($Version) { "https://github.com/$repo/releases/download/$Version" }
+            else          { "https://github.com/$repo/releases/latest/download" }
+    $src = Join-Path $env:TEMP "ods-dl-$PID"
+    New-Item -ItemType Directory -Force $src | Out-Null
+    foreach ($f in 'ods.exe', 'ods-gui.exe') {
+        Write-Host "downloading $f from $base" -ForegroundColor Cyan
+        Invoke-WebRequest -Uri "$base/$f" -OutFile (Join-Path $src $f)
+    }
+} else {
+    $src = Resolve-Path (Join-Path $PSScriptRoot '..\target\release')
+}
 $dir = Join-Path $env:LOCALAPPDATA 'ods'
 New-Item -ItemType Directory -Force $dir | Out-Null
 Copy-Item (Join-Path $src 'ods.exe')     $dir -Force
