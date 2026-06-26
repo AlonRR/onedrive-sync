@@ -9,6 +9,23 @@
 //! styling keeps the accessibility invariants of the prior restyle: WCAG-AA
 //! contrast, status shown by colour AND text/badge (never colour alone),
 //! generous spacing and click targets, and a text-zoom control.
+//!
+//! Accessibility:
+//! - **Keyboard**: every action is reachable by Tab and activated with Enter /
+//!   Space (egui built-in). F5 refreshes; Esc backs out of a confirm bar, then
+//!   the detail drawer. Text zoom is Ctrl +/-/0 (egui native) as well as the
+//!   A+/A- buttons; the on-screen % mirrors `ctx.zoom_factor()` either way.
+//! - **Focus**: a keyboard-focused control draws a 2px accent ring (the `active`
+//!   widget visuals), visibly distinct from the 1px hover stroke.
+//! - **Contrast**: every badge label and status text clears WCAG-AA (>= 4.5:1);
+//!   green is split into a darker fill (white text) and a lighter foreground.
+//! - **Screen reader**: eframe is built with AccessKit (incl. the Windows UIA
+//!   backend), so the widget tree is exposed and every control's accessible name
+//!   comes from its visible text (there are no icon-only controls). KNOWN LIMITS
+//!   inherent to egui: `egui::Grid` emits no table/row/column semantics (the
+//!   project list reads as a flat label sequence), and tooltip (`on_hover_text`)
+//!   text is not a reliable a11y channel — so no control's meaning lives only in
+//!   a tooltip.
 
 use crate::config::Config;
 use crate::discovery::discover;
@@ -25,7 +42,11 @@ use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 // Semantic palette (chosen for >= 4.5:1 contrast of the label text on each fill).
-const C_OK: Color32 = Color32::from_rgb(34, 139, 58);
+// Green is split: a darker fill carries WHITE badge text (5.1:1), while a lighter
+// shade is used when green is the FOREGROUND text on the dark surface (6.9:1) —
+// one constant can't satisfy both directions, so each usage gets the right one.
+const C_OK: Color32 = Color32::from_rgb(46, 125, 50); // success fill (white text on it)
+const C_OK_TEXT: Color32 = Color32::from_rgb(78, 180, 108); // green as text on dark bg
 const C_SKIP: Color32 = Color32::from_rgb(86, 92, 102);
 const C_UNDECIDED: Color32 = Color32::from_rgb(176, 132, 24);
 const C_ATTENTION: Color32 = Color32::from_rgb(206, 56, 56);
@@ -376,6 +397,36 @@ impl eframe::App for GuiApp {
         }
         ctx.request_repaint_after(Duration::from_millis(400));
 
+        // --- Keyboard accessibility: the whole app is operable without a mouse.
+        //     egui already zooms text on Ctrl +/-/0; mirror its factor into our
+        //     indicator so the % stays truthful whichever path changed it. Then
+        //     add the two shortcuts users expect: F5 refresh, Esc to back out. ---
+        self.zoom = ctx.zoom_factor();
+        let has_modal = self.confirm.is_some();
+        let has_selection = self.view == View::Projects && self.selected.is_some();
+        let mut do_refresh = false;
+        let mut do_escape = false;
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::F5) {
+                do_refresh = true;
+            }
+            // Only swallow Escape when there's something to dismiss, so it still
+            // reaches an open combo-box / popup the rest of the time.
+            if (has_modal || has_selection) && i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                do_escape = true;
+            }
+        });
+        if do_refresh {
+            self.refresh();
+        }
+        if do_escape {
+            if self.confirm.is_some() {
+                self.confirm = None; // cancel the pending destructive action first
+            } else {
+                self.selected = None; // then close the detail drawer
+            }
+        }
+
         // --- Chrome: title bar / nav rail / status bar / central content. Nested
         //     with show_inside since eframe::App::ui already hands us a CentralPanel Ui. ---
         let bar = egui::Frame::default().fill(C_BAR).inner_margin(egui::Margin::symmetric(14, 9));
@@ -431,11 +482,12 @@ impl GuiApp {
                 ui.separator();
                 // Accessibility: text size.
                 let z = self.zoom;
-                if ui.add_enabled(z < 1.79, egui::Button::new("A+")).on_hover_text("Larger text").clicked() {
+                if ui.add_enabled(z < 1.79, egui::Button::new("A+")).on_hover_text("Larger text  (Ctrl +)").clicked() {
                     self.set_zoom(ui.ctx(), z + 0.1);
                 }
-                ui.label(RichText::new(format!("{}%", (z * 100.0).round() as i32)).color(C_DIM).small());
-                if ui.add_enabled(z > 0.81, egui::Button::new("A-")).on_hover_text("Smaller text").clicked() {
+                ui.label(RichText::new(format!("{}%", (z * 100.0).round() as i32)).color(C_DIM).small())
+                    .on_hover_text("Text size — Ctrl 0 resets to 100%");
+                if ui.add_enabled(z > 0.81, egui::Button::new("A-")).on_hover_text("Smaller text  (Ctrl -)").clicked() {
                     self.set_zoom(ui.ctx(), z - 0.1);
                 }
                 ui.separator();
@@ -483,7 +535,7 @@ impl GuiApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Last run").color(C_DIM).small());
             let lr = self.last_run.clone();
-            let col = if lr.contains("error") { C_ATTENTION } else if lr.contains("warn") { C_UNDECIDED } else { C_OK };
+            let col = if lr.contains("error") { C_ATTENTION } else if lr.contains("warn") { C_UNDECIDED } else { C_OK_TEXT };
             ui.label(RichText::new(&lr).color(col).strong());
             ui.separator();
             let n = self.rows.len();
@@ -554,7 +606,7 @@ impl GuiApp {
                 ui.label(r.kind);
                 ui.label(if r.git { "git" } else { "-" });
                 if r.local {
-                    ui.label(RichText::new("yes").color(C_OK));
+                    ui.label(RichText::new("yes").color(C_OK_TEXT));
                 } else {
                     ui.label(RichText::new("no").color(C_DIM));
                 }
@@ -1161,10 +1213,14 @@ fn configure_style(ctx: &egui::Context) {
     v.widgets.hovered.bg_fill = Color32::from_rgb(58, 63, 74);
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, C_ACCENT);
     v.widgets.hovered.expansion = 1.0;
+    // `active` is also the KEYBOARD-FOCUS state (egui renders a focused widget with
+    // these visuals). A 2px accent ring + brighter fill makes a Tab-focused control
+    // read as clearly focused, distinct from the 1px hover stroke above.
     v.widgets.active.corner_radius = cr;
     v.widgets.active.weak_bg_fill = Color32::from_rgb(70, 76, 90);
     v.widgets.active.bg_fill = Color32::from_rgb(70, 76, 90);
-    v.widgets.active.bg_stroke = Stroke::new(1.0, C_ACCENT);
+    v.widgets.active.bg_stroke = Stroke::new(2.0, C_ACCENT);
+    v.widgets.active.expansion = 1.0;
     v.widgets.open.corner_radius = cr;
 
     style.visuals = v;
