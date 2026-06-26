@@ -607,6 +607,27 @@ mod tests {
     }
 
     #[test]
+    fn clean_scanned_deletes_junk_and_keeps_normal() {
+        // Exercises the DESTRUCTIVE path: the junk dir + file are removed, the
+        // ordinary file is left untouched.
+        let p = temp_paths("clean-delete");
+        std::fs::create_dir_all(p.bisync_dir()).unwrap(); // per-project lock lives here
+        let dest = p.onedrive.join("Plain");
+        std::fs::create_dir_all(dest.join("node_modules")).unwrap();
+        std::fs::write(dest.join("node_modules/x.js"), b"x").unwrap();
+        std::fs::write(dest.join("debug.log"), b"l").unwrap();
+        std::fs::write(dest.join("keep.txt"), b"k").unwrap();
+        let project = proj(p.user_profile.join("local"), dest.clone(), false);
+        let scan = scan_dest_filtered(&Config::default(), &project).expect("scan ok");
+        let (n, _) = clean_scanned(&p, &Config::default(), &project, &scan.items).expect("clean ok");
+        assert!(n >= 2, "removed at least the node_modules file and debug.log (got {n})");
+        assert!(!dest.join("node_modules").exists(), "the junk dir is gone");
+        assert!(!dest.join("debug.log").exists(), "the junk file is gone");
+        assert!(dest.join("keep.txt").exists(), "the ordinary file is UNTOUCHED");
+        let _ = std::fs::remove_dir_all(&p.onedrive);
+    }
+
+    #[test]
     fn restore_at_string_round_trips() {
         // archive_runs emits "%Y-%m-%d %H:%M:%S"; restore selects via parse_at on it,
         // so the two must agree on the format (the linchpin of GUI restore).
