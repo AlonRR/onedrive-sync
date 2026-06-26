@@ -60,6 +60,14 @@ enum Cmd {
     },
     /// List unresolved conflict files across projects.
     Conflicts,
+    /// Delete filtered files (e.g. node_modules) from a project's OneDrive copy,
+    /// enforcing "filtered files don't live on OneDrive". Previews unless --yes.
+    Clean {
+        id: String,
+        /// Actually delete (without this flag, only previews what would go).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Interactively choose which available projects to sync locally.
     Discover,
     /// Pause the scheduled sync (runs skip until `resume`).
@@ -232,6 +240,29 @@ fn dispatch(cmd: Cmd, paths: &Paths, config: &Config) -> Result<(), String> {
                         println!("   {}", f.display());
                     }
                 }
+            }
+        }
+        Cmd::Clean { id, yes } => {
+            let list = list_projects(paths, config);
+            let rid = actions::resolve_id(&list, &id, true)?;
+            let Some(p) = list.iter().find(|p| p.id == rid) else {
+                println!("No project matching '{id}'.");
+                return Ok(());
+            };
+            let scan = actions::scan_dest_filtered(config, p)?;
+            if scan.items.is_empty() {
+                println!("{rid}: OneDrive is already clean of filtered files.");
+                return Ok(());
+            }
+            println!("{rid}: {} entr(ies), {} file(s) on OneDrive match the filters:", scan.items.len(), scan.total_files);
+            for it in &scan.items {
+                println!("  {} {}", if it.is_dir { "DIR " } else { "file" }, it.rel);
+            }
+            if yes {
+                let (f, b) = actions::clean_scanned(paths, config, p, &scan.items)?;
+                println!("Cleaned {f} file(s), {b} bytes freed from the OneDrive copy.");
+            } else {
+                println!("(preview — re-run with --yes to delete)");
             }
         }
         Cmd::Discover => discover_interactive(paths, config),

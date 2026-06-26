@@ -40,6 +40,23 @@ pub fn ls_files(repo: &Path) -> Vec<String> {
     }
 }
 
+/// Committed file paths from HEAD (NUL-separated). Reads the COMMITTED tree, not
+/// the index — so it still works on a synced `.git` that omits the index (the
+/// sync filter excludes `/.git/index`). Returns `None` if HEAD can't be resolved
+/// (not a repo / no commits / error) so callers can REFUSE to act when the
+/// tracked set is unknown, rather than treating "unknown" as "nothing tracked".
+pub fn committed_files(repo: &Path) -> Option<Vec<String>> {
+    if run(repo, &["rev-parse", "--verify", "--quiet", "HEAD"]).code != 0 {
+        return None;
+    }
+    let o = run(repo, &["ls-tree", "-r", "--name-only", "-z", "HEAD"]);
+    if o.code == 0 {
+        Some(split_nul(&o.stdout))
+    } else {
+        None
+    }
+}
+
 /// Ignored/untracked paths git would exclude (directories collapsed), NUL-separated.
 pub fn ls_ignored(repo: &Path) -> Vec<String> {
     let o = run(

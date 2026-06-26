@@ -65,6 +65,37 @@ pub fn matches_exclude(rel: &str, exclude_dirs: &[String], exclude_files: &[Stri
     exclude_files.iter().any(|pat| glob_match(pat, leaf))
 }
 
+/// Whether a dest-relative path is FILTERED OUT of sync — i.e. junk that should
+/// not live on OneDrive. A conservative mirror of `generate`'s exclude precedence
+/// used by the "clean OneDrive" action:
+/// - `.git` is never touched;
+/// - anything in `keep` (the committed/tracked set) is KEPT (the filter force-
+///   includes tracked files even when they match an exclude rule);
+/// - a path under an excluded dir is filtered out (this wins over `sync_anyway`,
+///   exactly as the generated filter orders it);
+/// - otherwise an allow-listed leaf is kept, and an excluded-file glob is junk.
+///
+/// gitignore-derived excludes are intentionally NOT considered here (the clean
+/// action under-deletes rather than risk over-deleting).
+pub fn is_filtered_out(rel: &str, config: &Config, keep: &std::collections::HashSet<String>) -> bool {
+    let norm = rel.replace('\\', "/");
+    if norm == ".git" || norm.starts_with(".git/") {
+        return false;
+    }
+    if keep.contains(&norm) {
+        return false;
+    }
+    let segs: Vec<&str> = norm.split('/').collect();
+    if segs.len() >= 2 && segs[..segs.len() - 1].iter().any(|s| config.exclude_dirs.iter().any(|d| d == s)) {
+        return true;
+    }
+    let leaf = *segs.last().unwrap_or(&"");
+    if config.sync_anyway.iter().any(|p| glob_match(p, leaf)) {
+        return false;
+    }
+    config.exclude_files.iter().any(|p| glob_match(p, leaf))
+}
+
 /// Build the filter file content for a project (no trailing newline), matching
 /// New-OdsFilterFile's ordering exactly.
 pub fn generate(project: &Project, config: &Config) -> String {
@@ -124,4 +155,30 @@ pub fn generate(project: &Project, config: &Config) -> String {
     // default: include everything else.
     lines.push("+ **".to_string());
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn is_filtered_out_keeps_tracked_and_allow_listed_removes_junk() {
+        let c = Config::default(); // node_modules/target in exclude_dirs, *.log in exclude_files
+        let mut keep = HashSet::new();
+        keep.insert("src/main.rs".to_string());
+        keep.insert("build.log".to_string()); // a COMMITTED .log — must survive *.log
+
+        // junk that shouldn't be on OneDrive:
+        assert!(is_filtered_out("node_modules/react/index.js", &c, &keep));
+        assert!(is_filtered_out("debug.log", &c, &keep));
+        assert!(is_filtered_out("target/release/app.exe", &c, &keep));
+
+        // must be KEPT:
+        assert!(!is_filtered_out("src/main.rs", &c, &keep)); // tracked
+        assert!(!is_filtered_out("build.log", &c, &keep)); // tracked, beats *.log
+        assert!(!is_filtered_out(".env", &c, &keep)); // sync_anyway allow-list
+        assert!(!is_filtered_out("README.md", &c, &keep)); // ordinary file
+        assert!(!is_filtered_out(".git/config", &c, &keep)); // never touch .git
+    }
 }

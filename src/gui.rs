@@ -128,7 +128,7 @@ enum View {
     Projects,
     Pending,
     Retired,
-    AddWatch,
+    AddFolders,
     Settings,
 }
 
@@ -137,6 +137,7 @@ enum Confirm {
     Restore { id: String, at: String, label: String },
     DeleteConflict { id: String, path: PathBuf },
     UnmapDeleteLocal { id: String },
+    CleanDest { id: String },
 }
 
 /// Editable buffers for the Settings view (string-backed so partial edits are kept).
@@ -194,7 +195,9 @@ struct GuiApp {
     sel_maxdelete: String,
     watch_local: String,
     watch_dest: String,
+    root_path: String,
     conflict_view: Option<(String, Vec<PathBuf>)>,
+    clean_scan: Option<(String, actions::CleanScan)>,
     restore_runs: Option<Vec<actions::ArchiveRun>>,
     filter_text: Option<String>,
     confirm: Option<Confirm>,
@@ -265,6 +268,18 @@ fn ago(ts: &str) -> String {
     }
 }
 
+/// Compact human-readable byte size (B / KB / MB / GB).
+fn human_bytes(b: u64) -> String {
+    const U: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 { format!("{b} B") } else { format!("{v:.1} {}", U[i]) }
+}
+
 /// Middle-ellipsis a long id so its meaningful leaf stays visible (full id on hover).
 fn shorten(id: &str, max: usize) -> String {
     let chars: Vec<char> = id.chars().collect();
@@ -322,7 +337,9 @@ impl GuiApp {
             sel_maxdelete: String::new(),
             watch_local: String::new(),
             watch_dest: String::new(),
+            root_path: String::new(),
             conflict_view: None,
+            clean_scan: None,
             restore_runs: None,
             filter_text: None,
             confirm: None,
@@ -393,6 +410,7 @@ impl GuiApp {
         self.sel_compare = self.state.compare.get(id).cloned().unwrap_or_else(|| self.config.compare_mode.clone());
         self.sel_maxdelete = self.state.max_delete.get(id).map(|n| n.to_string()).unwrap_or_default();
         self.conflict_view = None;
+        self.clean_scan = None;
         self.restore_runs = None;
         self.filter_text = None;
         self.confirm = None;
@@ -539,7 +557,12 @@ impl eframe::App for GuiApp {
         // instead of scrolling off the end of a long grid).
         if self.view == View::Projects && self.selected.is_some() {
             let drawer = egui::Frame::default().fill(self.pal.card).inner_margin(egui::Margin::symmetric(18, 12));
-            egui::Panel::bottom("detail").resizable(false).frame(drawer).show_inside(ui, |ui| self.detail_panel(ui));
+            // Cap the drawer height and scroll inside it, so the inspect sections
+            // (clean / conflicts / versions / filter) stay reachable at the default
+            // window size instead of clipping below the fold.
+            egui::Panel::bottom("detail").resizable(true).default_size(300.0).max_size(460.0).frame(drawer).show_inside(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.detail_panel(ui));
+            });
         }
 
         let central = egui::Frame::default().fill(self.pal.bg).inner_margin(egui::Margin::symmetric(18, 14));
@@ -548,7 +571,7 @@ impl eframe::App for GuiApp {
                 View::Projects => self.view_projects(ui),
                 View::Pending => self.view_pending(ui),
                 View::Retired => self.view_retired(ui),
-                View::AddWatch => self.view_add_watch(ui),
+                View::AddFolders => self.view_add_folders(ui),
                 View::Settings => self.view_settings(ui),
             });
         });
@@ -622,7 +645,7 @@ impl GuiApp {
         let plabel = if self.pending.is_empty() { "Pending".to_string() } else { format!("Pending  ({})", self.pending.len()) };
         self.nav_item(ui, View::Pending, plabel);
         self.nav_item(ui, View::Retired, "Retired".to_string());
-        self.nav_item(ui, View::AddWatch, "Add watch".to_string());
+        self.nav_item(ui, View::AddFolders, "Add folders".to_string());
         self.nav_item(ui, View::Settings, "Settings".to_string());
     }
 
@@ -842,6 +865,16 @@ impl GuiApp {
                     self.restore_runs = Some(actions::archive_runs(&self.paths, &id));
                 }
             }
+            if ui.button("Clean OneDrive").on_hover_text("Find filtered files (e.g. node_modules) that shouldn't be on OneDrive").clicked() {
+                if self.clean_scan.is_some() {
+                    self.clean_scan = None;
+                } else if let Some(p) = self.find_project(&id) {
+                    match actions::scan_dest_filtered(&self.config, &p) {
+                        Ok(scan) => self.clean_scan = Some((id.clone(), scan)),
+                        Err(e) => self.status_msg = e,
+                    }
+                }
+            }
         });
 
         ui.add_space(8.0);
@@ -878,6 +911,7 @@ impl GuiApp {
         });
 
         self.conflict_section(ui);
+        self.clean_section(ui);
         self.restore_section(ui, &id);
         self.filter_section(ui);
     }
@@ -889,6 +923,10 @@ impl GuiApp {
             Confirm::Restore { label, .. } => format!("Restore from {label}? This overwrites the local copy (a backup is taken first)."),
             Confirm::DeleteConflict { path, .. } => format!("Delete conflict copy '{}'?", path.file_name().unwrap_or_default().to_string_lossy()),
             Confirm::UnmapDeleteLocal { id } => format!("Unmap {id} AND delete the local folder? The OneDrive copy is kept."),
+            Confirm::CleanDest { id } => {
+                let (files, bytes) = self.clean_scan.as_ref().map(|(_, s)| (s.total_files, s.total_bytes)).unwrap_or((0, 0));
+                format!("Delete {files} filtered file(s) ({}) from the OneDrive copy of {id}? They're excluded from sync (you regenerate them locally). git-ignored-only junk isn't included.", human_bytes(bytes))
+            }
         };
         let mut go = false;
         let mut cancel = false;
@@ -948,6 +986,20 @@ impl GuiApp {
                 self.selected = None;
                 self.refresh();
             }
+            Confirm::CleanDest { id } => {
+                let items = self.clean_scan.as_ref().map(|(_, s)| s.items.clone()).unwrap_or_default();
+                self.clean_scan = None;
+                self.run_job(&format!("cleaning OneDrive for {id}…"), move |p, c| {
+                    let list = discover(p, c, &Catalog::load(p));
+                    match list.iter().find(|x| x.id == id) {
+                        Some(proj) => match actions::clean_scanned(p, c, proj, &items) {
+                            Ok((f, b)) => format!("cleaned {f} filtered file(s), {} freed from {id}", human_bytes(b)),
+                            Err(e) => e,
+                        },
+                        None => format!("no project '{id}'"),
+                    }
+                });
+            }
         }
     }
 
@@ -976,6 +1028,50 @@ impl GuiApp {
         });
         if let Some(path) = del {
             self.confirm = Some(Confirm::DeleteConflict { id: cid, path });
+        }
+    }
+
+    /// Preview of filtered junk on the OneDrive copy; "Clean from OneDrive" stages
+    /// a brake-by-confirm deletion in the confirm bar.
+    fn clean_section(&mut self, ui: &mut egui::Ui) {
+        let Some((cid, scan)) = &self.clean_scan else { return };
+        let cid = cid.clone();
+        ui.add_space(8.0);
+        ui.label(RichText::new(format!("Filtered files on the OneDrive copy of {cid}:")).strong());
+        if scan.items.is_empty() {
+            ui.label(RichText::new("  (clean — nothing filtered is on OneDrive)").color(self.pal.ok_text));
+            return;
+        }
+        ui.label(
+            RichText::new(format!(
+                "  {} entr(ies) · {} file(s) · {} — these are excluded from sync (git-ignored-only junk is not listed)",
+                scan.items.len(),
+                scan.total_files,
+                human_bytes(scan.total_bytes)
+            ))
+            .color(self.pal.dim)
+            .small(),
+        );
+        let (dim, mono) = (self.pal.dim, self.pal.dim);
+        egui::ScrollArea::vertical().max_height(150.0).id_salt("clean").show(ui, |ui| {
+            for it in &scan.items {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(if it.is_dir { "DIR " } else { "file" }).color(mono).monospace().small());
+                    ui.monospace(&it.rel);
+                    ui.label(RichText::new(human_bytes(it.bytes)).color(dim).small());
+                });
+            }
+        });
+        let mut stage = false;
+        if ui
+            .add(egui::Button::new(RichText::new("Clean from OneDrive").color(Color32::WHITE)).fill(self.pal.attention))
+            .on_hover_text("Delete these filtered files from the OneDrive copy (keeps everything tracked)")
+            .clicked()
+        {
+            stage = true;
+        }
+        if stage {
+            self.confirm = Some(Confirm::CleanDest { id: cid });
         }
     }
 
@@ -1092,9 +1188,58 @@ impl GuiApp {
         }
     }
 
-    fn view_add_watch(&mut self, ui: &mut egui::Ui) {
-        ui.label("Map a local folder to an arbitrary OneDrive destination (watch project).");
+    fn view_add_folders(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Add folders");
         ui.add_space(8.0);
+
+        // --- Section A: scan a parent folder for projects (a discovery root). ---
+        ui.label(RichText::new("Scan a parent folder for projects").strong());
+        ui.label(
+            RichText::new("Auto-discovers every git project inside a folder — use this for a folder that holds many repos. New projects appear under Pending to activate.")
+                .color(self.pal.dim)
+                .small(),
+        );
+        ui.add_space(6.0);
+        let roots: Vec<String> = self.config.project_parents.iter().chain(self.config.watch_roots.iter()).cloned().collect();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Current roots:").color(self.pal.dim).small());
+            if roots.is_empty() {
+                ui.label(RichText::new("(none)").color(self.pal.dim).small());
+            } else {
+                for r in &roots {
+                    badge(ui, r, self.pal.skip);
+                }
+            }
+        });
+        ui.add_space(6.0);
+        let mut add_root = false;
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.root_path)
+                    .hint_text(r"C:\Users\you\OneDrive\Projects   or   C:\Users\you\Code")
+                    .desired_width(440.0),
+            );
+            if ui.add(primary(self.pal.accent_btn, "Add discovery root")).clicked() {
+                add_root = true;
+            }
+        });
+        if add_root {
+            let raw = self.root_path.trim().to_string();
+            if raw.is_empty() {
+                self.status_msg = "enter a folder path".into();
+            } else {
+                self.add_discovery_root(&raw);
+            }
+        }
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(12.0);
+
+        // --- Section B: map a single folder to a specific OneDrive destination. ---
+        ui.label(RichText::new("Map a single folder").strong());
+        ui.label(RichText::new("Sync one local folder to a specific OneDrive destination (a watch project).").color(self.pal.dim).small());
+        ui.add_space(6.0);
         egui::Grid::new("addwatch").num_columns(2).spacing([10.0, 12.0]).show(ui, |ui| {
             ui.label("Local folder (under your profile):");
             ui.add(egui::TextEdit::singleline(&mut self.watch_local).hint_text(r"C:\Users\you\Code\my-project").desired_width(440.0));
@@ -1104,7 +1249,7 @@ impl GuiApp {
             ui.end_row();
         });
         ui.add_space(8.0);
-        if ui.add(primary(self.pal.accent_btn, "Add watch mapping")).clicked() {
+        if ui.add(primary(self.pal.accent_btn, "Map folder")).clicked() {
             let (local, dest) = (self.watch_local.trim().to_string(), self.watch_dest.trim().to_string());
             if local.is_empty() || dest.is_empty() {
                 self.status_msg = "both folders are required".into();
@@ -1114,6 +1259,48 @@ impl GuiApp {
                     Err(e) => self.status_msg = e,
                 }
             }
+        }
+    }
+
+    /// Add a discovery root. Detects whether the folder is under OneDrive (a
+    /// project-parent, scanned for .git children) or under the user profile (a
+    /// watch-root) and stores the RELATIVE segment in the matching list — storing
+    /// an absolute path or the wrong list would silently break discovery.
+    fn add_discovery_root(&mut self, raw: &str) {
+        let p = std::path::Path::new(raw);
+        // OneDrive first: it lives under the profile, so it's the more specific root.
+        if let Some(rel) = crate::paths::rel_under(p, &self.paths.onedrive).filter(|s| !s.is_empty()) {
+            if self.config.project_parents.iter().any(|x| x.eq_ignore_ascii_case(&rel)) {
+                self.status_msg = format!("already a project parent: {rel}");
+                return;
+            }
+            self.config.project_parents.push(rel.clone());
+            self.save_config_after_root(format!("added project parent (under OneDrive): {rel}"));
+        } else if let Some(rel) = crate::paths::rel_under(p, &self.paths.user_profile).filter(|s| !s.is_empty()) {
+            if self.config.watch_roots.iter().any(|x| x.eq_ignore_ascii_case(&rel)) {
+                self.status_msg = format!("already a watch root: {rel}");
+                return;
+            }
+            self.config.watch_roots.push(rel.clone());
+            self.save_config_after_root(format!("added watch root (under profile): {rel}"));
+        } else {
+            self.status_msg = format!(
+                "Folder must be UNDER your OneDrive ({}) or your profile ({}).",
+                self.paths.onedrive.display(),
+                self.paths.user_profile.display()
+            );
+        }
+    }
+
+    fn save_config_after_root(&mut self, ok_msg: String) {
+        match self.config.save(&self.paths) {
+            Ok(()) => {
+                self.root_path.clear();
+                self.settings.loaded = false; // Settings view re-reads the new roots
+                self.status_msg = ok_msg;
+                self.refresh();
+            }
+            Err(e) => self.status_msg = format!("save failed: {e}"),
         }
     }
 

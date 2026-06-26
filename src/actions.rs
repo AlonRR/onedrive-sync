@@ -8,10 +8,12 @@ use crate::engine::{self, bisync, BisyncOpts};
 use crate::paths::{self, Paths};
 use crate::run::sync_project;
 use crate::state::{self, Catalog, CatalogEntry, MachineState, Status};
-use crate::{conflicts, events};
+use crate::{conflicts, events, filter, git};
 use chrono::{NaiveDateTime, Utc};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use walkdir::WalkDir;
 
 fn projects(paths: &Paths, config: &Config) -> Vec<Project> {
     discover(paths, config, &Catalog::load(paths))
@@ -174,6 +176,164 @@ pub fn delete_conflict(paths: &Paths, file: &Path) -> Result<(), String> {
     std::fs::remove_file(file).map_err(|e| e.to_string())?;
     events::log(paths, "INFO", &format!("Deleted conflict copy {}", file.display()));
     Ok(())
+}
+
+/// One filtered entry on the OneDrive (dest) side: a single junk file, or a whole
+/// excluded directory (e.g. `node_modules/`) aggregated as a unit.
+#[derive(Clone)]
+pub struct CleanItem {
+    pub path: PathBuf, // absolute, under dest
+    pub rel: String,   // dest-relative, forward-slash
+    pub is_dir: bool,
+    pub bytes: u64,
+    pub files: usize, // file count (1 for a file; recursive for a dir)
+}
+
+/// The result of scanning a project's OneDrive copy for filtered junk.
+pub struct CleanScan {
+    pub items: Vec<CleanItem>,
+    pub total_bytes: u64,
+    pub total_files: usize,
+}
+
+/// The set of paths that MUST be kept (never deleted) for a project. For a git
+/// project this is the COMMITTED tree of the OneDrive copy itself (machine-
+/// independent shared truth), unioned with the local working copy's tracked
+/// files. Returns `None` for a git project whose committed set can't be read —
+/// the caller must then refuse, never treat "unknown" as "delete everything".
+fn keep_set(project: &Project) -> Option<HashSet<String>> {
+    if !project.git {
+        return Some(HashSet::new()); // watch/plain: nothing tracked to protect
+    }
+    let committed = git::committed_files(&project.dest)?; // None -> refuse
+    if committed.is_empty() {
+        return None; // a git project with no readable HEAD -> refuse
+    }
+    let mut keep: HashSet<String> = committed.into_iter().map(|s| s.replace('\\', "/")).collect();
+    if project.local.join(".git").is_dir() {
+        for t in git::ls_files(&project.local) {
+            keep.insert(t.replace('\\', "/"));
+        }
+    }
+    Some(keep)
+}
+
+/// Recursively sum (bytes, file_count) under a directory.
+fn dir_size(dir: &Path) -> (u64, usize) {
+    let mut bytes = 0u64;
+    let mut files = 0usize;
+    for e in WalkDir::new(dir).into_iter().filter_map(Result::ok) {
+        if e.file_type().is_file() {
+            files += 1;
+            bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    (bytes, files)
+}
+
+/// Scan a project's OneDrive copy for filtered files that shouldn't be there.
+/// Whole excluded dirs are aggregated UNLESS they contain a kept (committed)
+/// file. Refuses (Err) for a git project whose tracked set can't be established,
+/// or if literally every file under the copy matches the filters (misconfig).
+pub fn scan_dest_filtered(config: &Config, project: &Project) -> Result<CleanScan, String> {
+    if !project.dest.exists() {
+        return Err("No OneDrive copy found for this project.".into());
+    }
+    let keep = keep_set(project).ok_or_else(|| {
+        "Refusing: can't read the committed file set from the OneDrive copy's .git (no HEAD). Pull or resync this project first, then retry.".to_string()
+    })?;
+
+    let mut items: Vec<CleanItem> = Vec::new();
+    let (mut total_bytes, mut total_files, mut dest_files) = (0u64, 0usize, 0usize);
+
+    let mut it = WalkDir::new(&project.dest).min_depth(1).into_iter();
+    while let Some(entry) = it.next() {
+        let Ok(entry) = entry else { continue };
+        let Some(rel) = paths::rel_under(entry.path(), &project.dest).map(|r| r.replace('\\', "/")) else { continue };
+        if rel == ".git" || rel.starts_with(".git/") {
+            if entry.file_type().is_dir() {
+                it.skip_current_dir();
+            }
+            continue;
+        }
+        if entry.file_type().is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if config.exclude_dirs.iter().any(|d| *d == name) {
+                let prefix = format!("{rel}/");
+                let has_kept = keep.iter().any(|k| k.starts_with(&prefix));
+                if !has_kept {
+                    let (b, f) = dir_size(entry.path());
+                    total_bytes += b;
+                    total_files += f;
+                    dest_files += f;
+                    items.push(CleanItem { path: entry.path().to_path_buf(), rel, is_dir: true, bytes: b, files: f });
+                    it.skip_current_dir(); // counted as a unit; don't descend
+                }
+            }
+            continue;
+        }
+        dest_files += 1;
+        if filter::is_filtered_out(&rel, config, &keep) {
+            let b = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            total_bytes += b;
+            total_files += 1;
+            items.push(CleanItem { path: entry.path().to_path_buf(), rel, is_dir: false, bytes: b, files: 1 });
+        }
+    }
+
+    if total_files > 0 && total_files >= dest_files {
+        return Err("Refusing: every file under the OneDrive copy matched the filters — that points to a misconfiguration, not junk. Check the exclude rules in Settings.".into());
+    }
+    Ok(CleanScan { items, total_bytes, total_files })
+}
+
+/// Delete the previously-scanned filtered items from the OneDrive copy. Holds the
+/// per-project lock (so a scheduled bisync can't race), re-derives the keep-set
+/// and RE-VERIFIES every item before removing it (defense in depth), and refuses
+/// to touch a protected root. These files are excluded by the sync filter, so
+/// their removal is invisible to bisync — no baseline reset is needed.
+pub fn clean_scanned(paths: &Paths, config: &Config, project: &Project, items: &[CleanItem]) -> Result<(usize, u64), String> {
+    let keep = keep_set(project).ok_or_else(|| "Refusing: the tracked set is no longer readable — aborting to avoid deleting committed files.".to_string())?;
+    let lock = paths.bisync_dir().join(format!("{}.lock", engine::id_hash(&project.id)));
+    let _g = crate::jsonio::lock_or_break(&lock, Duration::from_secs(600));
+
+    let (mut deleted, mut freed) = (0usize, 0u64);
+    for it in items {
+        // Containment + safety re-checks against the live tree.
+        if !it.path.starts_with(&project.dest) || it.rel == ".git" || it.rel.starts_with(".git/") {
+            continue;
+        }
+        if paths.is_protected_root(&it.path) {
+            continue;
+        }
+        if it.is_dir {
+            let name = it.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let prefix = format!("{}/", it.rel);
+            if !config.exclude_dirs.iter().any(|d| *d == name) || keep.iter().any(|k| k.starts_with(&prefix)) {
+                continue; // dir no longer excluded, or now holds a kept file
+            }
+            if it.path.is_dir() {
+                let (b, f) = dir_size(&it.path);
+                if std::fs::remove_dir_all(&it.path).is_ok() {
+                    deleted += f;
+                    freed += b;
+                }
+            }
+        } else {
+            if !filter::is_filtered_out(&it.rel, config, &keep) {
+                continue; // no longer junk (e.g. now tracked)
+            }
+            if it.path.is_file() {
+                let b = it.path.metadata().map(|m| m.len()).unwrap_or(0);
+                if std::fs::remove_file(&it.path).is_ok() {
+                    deleted += 1;
+                    freed += b;
+                }
+            }
+        }
+    }
+    events::log(paths, "INFO", &format!("Cleaned {deleted} filtered file(s) ({freed} bytes) from the OneDrive copy of {}.", project.id));
+    Ok((deleted, freed))
 }
 
 /// Write a diagnostic bundle (config + machine-state + recent log tail) to %TEMP%
@@ -406,6 +566,44 @@ mod tests {
         assert!(!conflict.exists());
 
         let _ = std::fs::remove_dir_all(&p.local_root);
+    }
+
+    fn proj(local: PathBuf, dest: PathBuf, git: bool) -> Project {
+        Project { id: "Proj".into(), name: "Proj".into(), kind: crate::discovery::Kind::Mirror, local, dest, git }
+    }
+
+    #[test]
+    fn clean_refuses_git_project_with_no_committed_set() {
+        // THE safety test: a git project whose committed set can't be read must be
+        // REFUSED — otherwise an empty tracked set would let the clean delete
+        // committed files from the shared OneDrive copy.
+        let p = temp_paths("clean-norefs");
+        let dest = p.onedrive.join("Proj");
+        std::fs::create_dir_all(dest.join("node_modules")).unwrap();
+        std::fs::write(dest.join("node_modules/x.js"), b"x").unwrap();
+        let project = proj(p.user_profile.join("absent-local"), dest.clone(), true);
+        assert!(
+            scan_dest_filtered(&Config::default(), &project).is_err(),
+            "a git project with no readable HEAD on the dest copy must be refused"
+        );
+        let _ = std::fs::remove_dir_all(&p.onedrive);
+    }
+
+    #[test]
+    fn scan_flags_junk_and_keeps_normal_for_non_git() {
+        let p = temp_paths("clean-scan");
+        let dest = p.onedrive.join("Plain");
+        std::fs::create_dir_all(dest.join("node_modules")).unwrap();
+        std::fs::write(dest.join("node_modules/x.js"), b"x").unwrap();
+        std::fs::write(dest.join("debug.log"), b"l").unwrap();
+        std::fs::write(dest.join("keep.txt"), b"k").unwrap();
+        let project = proj(p.user_profile.join("local"), dest.clone(), false);
+        let scan = scan_dest_filtered(&Config::default(), &project).expect("non-git scan should succeed");
+        let rels: Vec<&str> = scan.items.iter().map(|i| i.rel.as_str()).collect();
+        assert!(rels.contains(&"node_modules"), "the node_modules dir is flagged as a unit");
+        assert!(rels.contains(&"debug.log"), "a *.log file is flagged");
+        assert!(!rels.iter().any(|r| r.contains("keep.txt")), "an ordinary file is kept");
+        let _ = std::fs::remove_dir_all(&p.onedrive);
     }
 
     #[test]
