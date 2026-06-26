@@ -1173,17 +1173,55 @@ impl GuiApp {
     }
 }
 
-/// Tuned dark theme: layered surfaces, rounded widgets, high-contrast text,
-/// generous spacing, comfortable click targets, and a readable type scale.
-fn configure_style(ctx: &egui::Context) {
+/// Install the native Windows UI font (Segoe UI) so body text isn't egui's
+/// default Ubuntu-Light, which reads far too thin. Returns the family to use
+/// for headings/buttons — Segoe UI Semibold if present, else the regular
+/// proportional family. Falls back silently to egui's defaults if the font
+/// files are missing (we read the OS-installed copies, we don't bundle them).
+fn install_fonts(ctx: &egui::Context) -> egui::FontFamily {
+    use egui::FontFamily;
+    fn add(fonts: &mut egui::FontDefinitions, key: &str, file: &str) -> bool {
+        match std::fs::read(format!(r"C:\Windows\Fonts\{file}")) {
+            Ok(b) => {
+                fonts.font_data.insert(key.to_string(), std::sync::Arc::new(egui::FontData::from_owned(b)));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+    let mut fonts = egui::FontDefinitions::default();
+    let have_regular = add(&mut fonts, "segoe", "segoeui.ttf"); // regular (400), NOT Light
+    let have_semibold = add(&mut fonts, "segoe-sb", "seguisb.ttf"); // semibold (600)
+    let have_mono = add(&mut fonts, "consolas", "consola.ttf");
+    if have_regular {
+        fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "segoe".into());
+    }
+    if have_mono {
+        fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "consolas".into());
+    }
+    let bold = if have_semibold {
+        let fam = FontFamily::Name("semibold".into());
+        fonts.families.insert(fam.clone(), vec!["segoe-sb".into(), "segoe".into()]);
+        fam
+    } else {
+        FontFamily::Proportional
+    };
+    ctx.set_fonts(fonts);
+    bold
+}
+
+/// Tuned theme: layered surfaces, rounded widgets, high-contrast text, generous
+/// spacing, comfortable click targets, and a readable type scale. `bold` is the
+/// heavier family installed by [`install_fonts`], used for headings and buttons.
+fn configure_style(ctx: &egui::Context, bold: egui::FontFamily) {
     use egui::{CornerRadius, FontFamily::Proportional, FontId, Stroke, TextStyle};
     let mut style = (*ctx.global_style()).clone();
     style.text_styles = [
-        (TextStyle::Heading, FontId::new(20.0, Proportional)),
+        (TextStyle::Heading, FontId::new(20.0, bold.clone())),
         (TextStyle::Body, FontId::new(15.0, Proportional)),
         (TextStyle::Monospace, FontId::new(14.0, egui::FontFamily::Monospace)),
-        (TextStyle::Button, FontId::new(15.0, Proportional)),
-        (TextStyle::Small, FontId::new(12.0, Proportional)),
+        (TextStyle::Button, FontId::new(15.0, bold)),
+        (TextStyle::Small, FontId::new(12.5, Proportional)),
     ]
     .into();
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
@@ -1242,7 +1280,8 @@ pub fn run_gui(paths: Paths, config: Config) -> eframe::Result {
         "OneDrive Sync",
         native_options,
         Box::new(move |cc| {
-            configure_style(&cc.egui_ctx);
+            let bold = install_fonts(&cc.egui_ctx);
+            configure_style(&cc.egui_ctx, bold);
             Ok(Box::new(GuiApp::new(paths, config)))
         }),
     )
