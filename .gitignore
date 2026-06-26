@@ -1,3 +1,6 @@
 /target
 **/*.rs.bk
 *.pdb
+
+# runtime shared catalog — lives in OneDrive, merged across machines; never committed
+/mappings.json
