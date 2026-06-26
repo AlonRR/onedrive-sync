@@ -10,7 +10,8 @@
 //! Accessibility (grounded in WCAG 2.2 / Israel IS 5568 / US §508 — all == WCAG
 //! 2.0 AA — plus GOV.UK and Material design-system guidance; see [`Palette`]):
 //! - **Themes**: a full light AND dark [`Palette`], toggled at runtime and
-//!   persisted (`config.theme`); the default "system" follows the OS. Every
+//!   persisted (`config.theme`); the default "system" follows the OS theme
+//!   where eframe reports one, otherwise dark. Every
 //!   (foreground, background) pair is verified >= AA (body text clears AAA), and
 //!   status is shown by colour AND a text badge (never colour alone). Dark
 //!   surfaces follow Material (no pure black, lighter = higher elevation).
