@@ -333,7 +333,13 @@ impl GuiApp {
             zoom: 1.0,
             pal,
             bold,
-            applied_dark: Some(pal.dark), // run_gui already applied this theme
+            // Start unset so the per-frame guard applies the theme on the FIRST
+            // ui() frame. eframe resets visuals to its own default after the
+            // creation closure, clobbering a style set only at creation — so if
+            // we skipped the frame-1 apply, the theme wouldn't show until the
+            // first manual toggle. (Regression fix: themes not taking effect
+            // until you switch them.)
+            applied_dark: None,
             logo: None,
             _tray: tray,
             show_id,
