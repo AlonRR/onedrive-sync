@@ -1,24 +1,3 @@
-# This repo contains only the tool's source. Runtime state lives elsewhere
-# (%LOCALAPPDATA%\onedrive-sync and the staged app copy), never here.
-
-# OS / editor noise
-Thumbs.db
-desktop.ini
-.DS_Store
-*.swp
-
-# Local test/dev artifacts (should not normally appear in this folder)
-*.log
-rclone.exe
-
-# Defensive: this repo is the tool's SOURCE and must never contain secrets.
-# (Managed project folders may hold these and sync via the allow-list — but not here.)
-.env
-.env.*
-*.env
-*.local
-*.pem
-*.key
-*.pfx
-*.p12
-sync-config.local.ps1
+/target
+**/*.rs.bk
+*.pdb
