@@ -41,6 +41,10 @@ pub struct Config {
     pub retry_max_wait_seconds: u64,
     /// Escalate (log ERROR) a repo deferred this many consecutive cycles.
     pub defer_escalate_cycles: u32,
+
+    /// GUI theme: "system" (follow the OS, default), "dark", or "light". Only the
+    /// management window reads this; it has no effect on sync behaviour.
+    pub theme: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +86,7 @@ impl Default for Config {
             retry_backoff: vec![5, 10, 20],
             retry_max_wait_seconds: 120,
             defer_escalate_cycles: 5,
+            theme: "system".to_string(),
         }
     }
 }

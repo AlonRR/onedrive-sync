@@ -5,20 +5,23 @@
 //!
 //! Layout follows mainstream desktop-app convention: a top title bar with the
 //! global actions, a left navigation rail, a persistent bottom status bar
-//! (Nielsen "visibility of system status"), and a central content area. The
-//! styling keeps the accessibility invariants of the prior restyle: WCAG-AA
-//! contrast, status shown by colour AND text/badge (never colour alone),
-//! generous spacing and click targets, and a text-zoom control.
+//! (Nielsen "visibility of system status"), and a central content area.
 //!
-//! Accessibility:
+//! Accessibility (grounded in WCAG 2.2 / Israel IS 5568 / US §508 — all == WCAG
+//! 2.0 AA — plus GOV.UK and Material design-system guidance; see [`Palette`]):
+//! - **Themes**: a full light AND dark [`Palette`], toggled at runtime and
+//!   persisted (`config.theme`); the default "system" follows the OS. Every
+//!   (foreground, background) pair is verified >= AA (body text clears AAA), and
+//!   status is shown by colour AND a text badge (never colour alone). Dark
+//!   surfaces follow Material (no pure black, lighter = higher elevation).
+//! - **Font**: the OS-native Segoe UI (regular body, Semibold headings/buttons)
+//!   replaces egui's thin Ubuntu-Light default; see [`install_fonts`].
 //! - **Keyboard**: every action is reachable by Tab and activated with Enter /
 //!   Space (egui built-in). F5 refreshes; Esc backs out of a confirm bar, then
 //!   the detail drawer. Text zoom is Ctrl +/-/0 (egui native) as well as the
 //!   A+/A- buttons; the on-screen % mirrors `ctx.zoom_factor()` either way.
 //! - **Focus**: a keyboard-focused control draws a 2px accent ring (the `active`
 //!   widget visuals), visibly distinct from the 1px hover stroke.
-//! - **Contrast**: every badge label and status text clears WCAG-AA (>= 4.5:1);
-//!   green is split into a darker fill (white text) and a lighter foreground.
 //! - **Screen reader**: eframe is built with AccessKit (incl. the Windows UIA
 //!   backend), so the widget tree is exposed and every control's accessible name
 //!   comes from its visible text (there are no icon-only controls). KNOWN LIMITS
@@ -41,24 +44,83 @@ use std::time::Duration;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-// Semantic palette (chosen for >= 4.5:1 contrast of the label text on each fill).
-// Green is split: a darker fill carries WHITE badge text (5.1:1), while a lighter
-// shade is used when green is the FOREGROUND text on the dark surface (6.9:1) —
-// one constant can't satisfy both directions, so each usage gets the right one.
-const C_OK: Color32 = Color32::from_rgb(46, 125, 50); // success fill (white text on it)
-const C_OK_TEXT: Color32 = Color32::from_rgb(78, 180, 108); // green as text on dark bg
-const C_SKIP: Color32 = Color32::from_rgb(86, 92, 102);
-const C_UNDECIDED: Color32 = Color32::from_rgb(176, 132, 24);
-const C_ATTENTION: Color32 = Color32::from_rgb(206, 56, 56);
-const C_ACCENT: Color32 = Color32::from_rgb(74, 142, 240);
-const C_TEXT: Color32 = Color32::from_rgb(232, 234, 238);
-const C_DIM: Color32 = Color32::from_rgb(150, 156, 166);
+const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
+    Color32::from_rgb(r, g, b)
+}
 
-// Surface palette (layered darkest -> lightest so regions read as distinct planes).
-const C_BG: Color32 = Color32::from_rgb(22, 24, 29); // central content
-const C_NAV: Color32 = Color32::from_rgb(28, 30, 37); // left rail
-const C_BAR: Color32 = Color32::from_rgb(17, 19, 23); // title + status bars
-const C_CARD: Color32 = Color32::from_rgb(33, 36, 44); // groups / detail panel
+/// A complete theme. Every (foreground, background) pair a label can land on is
+/// verified >= WCAG-AA (4.5:1 text, 3:1 non-text); body text clears AAA (>= 7:1).
+/// Grounded in: WCAG 2.2 / Israel IS 5568 (== WCAG 2.0 AA) / US §508 (USWDS) for
+/// the thresholds; GOV.UK Design System for the light semantic hues; Material's
+/// dark-theme guidance (no pure black, lighter surfaces = higher elevation,
+/// desaturated accents, no pure-white-on-black) for the dark surfaces.
+///
+/// `accent` and several semantic colours are SPLIT by role: a colour bright
+/// enough to read as text on the surface can't also be a white-text fill (the
+/// two pull oppositely), so e.g. `accent` (ring/links) vs `accent_btn` (fill),
+/// and `attention`/`ok` (fills) vs `attention_text`/`ok_text` (foreground).
+#[derive(Clone, Copy)]
+struct Palette {
+    dark: bool,
+    bg: Color32,   // central content
+    nav: Color32,  // left rail
+    bar: Color32,  // title + status bars
+    card: Color32, // groups / detail panel
+    text: Color32, // primary (high-emphasis) text
+    dim: Color32,  // secondary (medium-emphasis) text
+    accent: Color32,       // focus ring, selection, links, accent text
+    accent_btn: Color32,   // primary-button fill (white label)
+    ok: Color32,           // "active"/success badge fill
+    ok_text: Color32,      // success as foreground text
+    skip: Color32,         // "skip" badge fill
+    undecided: Color32,    // "undecided"/warn fill AND foreground (passes both)
+    attention: Color32,    // attention/error badge + button fill
+    attention_text: Color32, // attention/error as foreground text
+    warn_surface: Color32, // confirm-bar background
+}
+
+impl Palette {
+    fn dark() -> Self {
+        Self {
+            dark: true,
+            bg: rgb(22, 24, 29), nav: rgb(28, 30, 37), bar: rgb(17, 19, 23), card: rgb(33, 36, 44),
+            text: rgb(232, 234, 238), dim: rgb(166, 172, 182),
+            accent: rgb(59, 130, 246), accent_btn: rgb(37, 99, 201),
+            ok: rgb(46, 125, 50), ok_text: rgb(78, 193, 123), skip: rgb(86, 92, 102),
+            undecided: rgb(176, 132, 24), attention: rgb(206, 56, 56),
+            attention_text: rgb(232, 112, 107), warn_surface: rgb(58, 37, 38),
+        }
+    }
+    fn light() -> Self {
+        Self {
+            dark: false,
+            bg: rgb(251, 252, 253), nav: rgb(238, 241, 244), bar: rgb(231, 235, 239), card: rgb(255, 255, 255),
+            text: rgb(22, 25, 29), dim: rgb(86, 93, 100),
+            accent: rgb(29, 112, 184), accent_btn: rgb(29, 112, 184),
+            ok: rgb(15, 122, 82), ok_text: rgb(12, 106, 71), skip: rgb(95, 101, 109),
+            undecided: rgb(120, 91, 0), attention: rgb(197, 48, 30),
+            attention_text: rgb(197, 48, 30), warn_surface: rgb(252, 232, 230),
+        }
+    }
+}
+
+/// WCAG relative luminance of a colour (sRGB, gamma-expanded).
+fn luminance(c: Color32) -> f32 {
+    fn lin(u: u8) -> f32 {
+        let c = u as f32 / 255.0;
+        if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    }
+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+}
+
+/// Pick black or white text for the higher contrast on `fill` (so a badge stays
+/// AA-legible whichever theme set the fill).
+fn best_fg(fill: Color32) -> Color32 {
+    let l = luminance(fill);
+    let on_black = (l + 0.05) / 0.05;
+    let on_white = 1.05 / (l + 0.05);
+    if on_black >= on_white { Color32::BLACK } else { Color32::WHITE }
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum View {
@@ -140,6 +202,9 @@ struct GuiApp {
     settings: SettingsForm,
     filter: String,
     zoom: f32,
+    pal: Palette,
+    bold: egui::FontFamily,
+    applied_dark: Option<bool>,
     logo: Option<egui::TextureHandle>,
     _tray: TrayIcon,
     show_id: MenuId,
@@ -151,9 +216,10 @@ fn make_icon(rgb: [u8; 3]) -> Icon {
     Icon::from_rgba(icon::rgba(32, rgb), 32, 32).expect("icon")
 }
 
-/// A filled accent "primary" button (white label for contrast on the blue fill).
-fn primary(text: &str) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text.to_string()).strong().color(Color32::WHITE)).fill(C_ACCENT)
+/// A filled accent "primary" button. `fill` is the theme's `accent_btn`, chosen
+/// so the white label clears AA (>= 5:1) in both themes.
+fn primary(fill: Color32, text: &str) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text.to_string()).strong().color(Color32::WHITE)).fill(fill)
 }
 
 /// Open a folder in Explorer, fire-and-forget. (explorer.exe returns a nonzero
@@ -212,13 +278,15 @@ fn shorten(id: &str, max: usize) -> String {
     format!("{h}…{t}")
 }
 
-/// A colour+text status chip (never colour alone — the word carries the meaning too).
-fn badge(ui: &mut egui::Ui, text: &str, fill: Color32, fg: Color32) {
-    ui.label(RichText::new(format!(" {text} ")).color(fg).background_color(fill).strong());
+/// A colour+text status chip (never colour alone — the word carries the meaning
+/// too). The text colour is auto-picked for max contrast on `fill`, so the chip
+/// stays AA-legible whichever theme supplied the fill.
+fn badge(ui: &mut egui::Ui, text: &str, fill: Color32) {
+    ui.label(RichText::new(format!(" {text} ")).color(best_fg(fill)).background_color(fill).strong());
 }
 
 impl GuiApp {
-    fn new(paths: Paths, config: Config) -> Self {
+    fn new(paths: Paths, config: Config, pal: Palette, bold: egui::FontFamily) -> Self {
         let menu = Menu::new();
         let show = MenuItem::new("Show window", true, None);
         let sync = MenuItem::new("Sync all now", true, None);
@@ -262,6 +330,9 @@ impl GuiApp {
             settings: SettingsForm::default(),
             filter: String::new(),
             zoom: 1.0,
+            pal,
+            bold,
+            applied_dark: Some(pal.dark), // run_gui already applied this theme
             logo: None,
             _tray: tray,
             show_id,
@@ -353,6 +424,17 @@ impl GuiApp {
         ctx.set_zoom_factor(self.zoom);
     }
 
+    /// Flip light/dark, persist the explicit choice, and let the per-frame guard
+    /// re-apply the style (it detects the `pal.dark` change).
+    fn toggle_theme(&mut self) {
+        let to_dark = !self.pal.dark;
+        self.pal = if to_dark { Palette::dark() } else { Palette::light() };
+        self.config.theme = if to_dark { "dark" } else { "light" }.to_string();
+        if let Err(e) = self.config.save(&self.paths) {
+            self.status_msg = format!("theme not saved: {e}");
+        }
+    }
+
     /// Start a full run (sync or dry-run) honouring the "approve deletes" toggle.
     fn run_all(&mut self, msg: &str, dry: bool) {
         let approve = self.approve_deletes;
@@ -366,6 +448,14 @@ impl GuiApp {
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // Apply the theme's style whenever it changes (and on the first frame).
+        // Re-derived from `self.pal` so a runtime toggle can never desync the
+        // chrome from the surface colours the panels paint with.
+        if self.applied_dark != Some(self.pal.dark) {
+            configure_style(&ctx, self.bold.clone(), self.pal);
+            self.applied_dark = Some(self.pal.dark);
+        }
 
         // --- Once-per-frame housekeeping (must stay before the panels so the tray
         //     menu keeps pumping and background jobs are reaped). ---
@@ -429,23 +519,23 @@ impl eframe::App for GuiApp {
 
         // --- Chrome: title bar / nav rail / status bar / central content. Nested
         //     with show_inside since eframe::App::ui already hands us a CentralPanel Ui. ---
-        let bar = egui::Frame::default().fill(C_BAR).inner_margin(egui::Margin::symmetric(14, 9));
+        let bar = egui::Frame::default().fill(self.pal.bar).inner_margin(egui::Margin::symmetric(14, 9));
         egui::Panel::top("titlebar").frame(bar).show_inside(ui, |ui| self.titlebar(ui));
 
-        let status = egui::Frame::default().fill(C_BAR).inner_margin(egui::Margin::symmetric(14, 7));
+        let status = egui::Frame::default().fill(self.pal.bar).inner_margin(egui::Margin::symmetric(14, 7));
         egui::Panel::bottom("statusbar").frame(status).show_inside(ui, |ui| self.statusbar(ui));
 
-        let nav = egui::Frame::default().fill(C_NAV).inner_margin(egui::Margin::symmetric(10, 14));
+        let nav = egui::Frame::default().fill(self.pal.nav).inner_margin(egui::Margin::symmetric(10, 14));
         egui::Panel::left("nav").exact_size(172.0).resizable(false).frame(nav).show_inside(ui, |ui| self.nav(ui));
 
         // Selected-project detail as a fixed bottom drawer (actions stay visible
         // instead of scrolling off the end of a long grid).
         if self.view == View::Projects && self.selected.is_some() {
-            let drawer = egui::Frame::default().fill(C_CARD).inner_margin(egui::Margin::symmetric(18, 12));
+            let drawer = egui::Frame::default().fill(self.pal.card).inner_margin(egui::Margin::symmetric(18, 12));
             egui::Panel::bottom("detail").resizable(false).frame(drawer).show_inside(ui, |ui| self.detail_panel(ui));
         }
 
-        let central = egui::Frame::default().fill(C_BG).inner_margin(egui::Margin::symmetric(18, 14));
+        let central = egui::Frame::default().fill(self.pal.bg).inner_margin(egui::Margin::symmetric(18, 14));
         egui::CentralPanel::default().frame(central).show_inside(ui, |ui| {
             egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| match self.view {
                 View::Projects => self.view_projects(ui),
@@ -470,11 +560,11 @@ impl GuiApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Pause / resume (rightmost).
                 if self.paused {
-                    if ui.add(primary("Resume")).on_hover_text("Re-enable the scheduled sync").clicked() {
+                    if ui.add(primary(self.pal.accent_btn, "Resume")).on_hover_text("Re-enable the scheduled sync").clicked() {
                         actions::resume(&self.paths);
                         self.refresh();
                     }
-                    badge(ui, "PAUSED", C_UNDECIDED, Color32::BLACK);
+                    badge(ui, "PAUSED", self.pal.undecided);
                 } else if ui.button("Pause").on_hover_text("Skip scheduled runs until resumed").clicked() {
                     actions::pause(&self.paths);
                     self.refresh();
@@ -485,14 +575,24 @@ impl GuiApp {
                 if ui.add_enabled(z < 1.79, egui::Button::new("A+")).on_hover_text("Larger text  (Ctrl +)").clicked() {
                     self.set_zoom(ui.ctx(), z + 0.1);
                 }
-                ui.label(RichText::new(format!("{}%", (z * 100.0).round() as i32)).color(C_DIM).small())
+                ui.label(RichText::new(format!("{}%", (z * 100.0).round() as i32)).color(self.pal.dim).small())
                     .on_hover_text("Text size — Ctrl 0 resets to 100%");
                 if ui.add_enabled(z > 0.81, egui::Button::new("A-")).on_hover_text("Smaller text  (Ctrl -)").clicked() {
                     self.set_zoom(ui.ctx(), z - 0.1);
                 }
                 ui.separator();
+                // Appearance: light/dark theme toggle (label names the TARGET theme).
+                let (tlabel, thover) = if self.pal.dark {
+                    ("\u{2600} Light", "Switch to the light theme")
+                } else {
+                    ("\u{263E} Dark", "Switch to the dark theme")
+                };
+                if ui.button(tlabel).on_hover_text(thover).clicked() {
+                    self.toggle_theme();
+                }
+                ui.separator();
                 // Global run actions.
-                if ui.add_enabled(!self.busy, primary("Sync all")).on_hover_text("Sync every active project now").clicked() {
+                if ui.add_enabled(!self.busy, primary(self.pal.accent_btn, "Sync all")).on_hover_text("Sync every active project now").clicked() {
                     self.run_all("syncing all…", false);
                 }
                 if ui.add_enabled(!self.busy, egui::Button::new("Dry-run all")).on_hover_text("Preview every active project; changes nothing").clicked() {
@@ -509,7 +609,7 @@ impl GuiApp {
 
     fn nav(&mut self, ui: &mut egui::Ui) {
         ui.add_space(2.0);
-        ui.label(RichText::new("VIEWS").size(11.0).color(C_DIM).strong());
+        ui.label(RichText::new("VIEWS").size(11.0).color(self.pal.dim).strong());
         ui.add_space(8.0);
         self.nav_item(ui, View::Projects, "Projects".to_string());
         let plabel = if self.pending.is_empty() { "Pending".to_string() } else { format!("Pending  ({})", self.pending.len()) };
@@ -533,27 +633,27 @@ impl GuiApp {
 
     fn statusbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Last run").color(C_DIM).small());
+            ui.label(RichText::new("Last run").color(self.pal.dim).small());
             let lr = self.last_run.clone();
-            let col = if lr.contains("error") { C_ATTENTION } else if lr.contains("warn") { C_UNDECIDED } else { C_OK_TEXT };
+            let col = if lr.contains("error") { self.pal.attention_text } else if lr.contains("warn") { self.pal.undecided } else { self.pal.ok_text };
             ui.label(RichText::new(&lr).color(col).strong());
             ui.separator();
             let n = self.rows.len();
             let att = self.rows.iter().filter(|r| r.attention || r.conflicts > 0).count();
-            ui.label(RichText::new(format!("{n} projects")).color(C_DIM));
+            ui.label(RichText::new(format!("{n} projects")).color(self.pal.dim));
             if att > 0 {
-                ui.label(RichText::new(format!("· {att} need attention")).color(C_ATTENTION).strong());
+                ui.label(RichText::new(format!("· {att} need attention")).color(self.pal.attention_text).strong());
             }
             if self.paused {
                 ui.separator();
-                badge(ui, "PAUSED", C_UNDECIDED, Color32::BLACK);
+                badge(ui, "PAUSED", self.pal.undecided);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.busy {
                     ui.spinner();
-                    ui.label(RichText::new(&self.busy_msg).color(C_ACCENT));
+                    ui.label(RichText::new(&self.busy_msg).color(self.pal.accent));
                 } else if !self.status_msg.is_empty() {
-                    ui.label(RichText::new(&self.status_msg).color(C_DIM).italics());
+                    ui.label(RichText::new(&self.status_msg).color(self.pal.dim).italics());
                 }
             });
         });
@@ -562,16 +662,16 @@ impl GuiApp {
     fn view_projects(&mut self, ui: &mut egui::Ui) {
         // Legend (explains the colour coding — colour is never the only cue).
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Legend:").color(C_DIM).small());
-            badge(ui, "active", C_OK, Color32::WHITE);
-            badge(ui, "skip", C_SKIP, Color32::WHITE);
-            badge(ui, "undecided", C_UNDECIDED, Color32::BLACK);
-            badge(ui, "attention", C_ATTENTION, Color32::WHITE);
+            ui.label(RichText::new("Legend:").color(self.pal.dim).small());
+            badge(ui, "active", self.pal.ok);
+            badge(ui, "skip", self.pal.skip);
+            badge(ui, "undecided", self.pal.undecided);
+            badge(ui, "attention", self.pal.attention);
         });
         ui.add_space(4.0);
         // Filter box (recognition over recall; scales to many projects).
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Filter:").color(C_DIM));
+            ui.label(RichText::new("Filter:").color(self.pal.dim));
             ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("type to filter projects…").desired_width(260.0));
             if !self.filter.is_empty() && ui.button("clear").clicked() {
                 self.filter.clear();
@@ -587,36 +687,36 @@ impl GuiApp {
         let mut clicked: Option<String> = None;
         egui::Grid::new("projects").striped(true).num_columns(8).spacing([14.0, 10.0]).show(ui, |ui| {
             for h in ["STATUS", "KIND", "GIT", "LOCAL", "LAST SYNC", "CONFLICTS", "COMPARE", "PROJECT"] {
-                ui.label(RichText::new(h).color(C_DIM).small().strong());
+                ui.label(RichText::new(h).color(self.pal.dim).small().strong());
             }
             ui.end_row();
             for &i in &visible {
                 let r = &self.rows[i];
                 // status badge (attention overrides; both colour AND word).
                 if r.attention {
-                    badge(ui, "attention", C_ATTENTION, Color32::WHITE);
+                    badge(ui, "attention", self.pal.attention);
                 } else {
-                    let (fill, fg) = match r.status.as_str() {
-                        "active" => (C_OK, Color32::WHITE),
-                        "skip" => (C_SKIP, Color32::WHITE),
-                        _ => (C_UNDECIDED, Color32::BLACK),
+                    let fill = match r.status.as_str() {
+                        "active" => self.pal.ok,
+                        "skip" => self.pal.skip,
+                        _ => self.pal.undecided,
                     };
-                    badge(ui, &r.status, fill, fg);
+                    badge(ui, &r.status, fill);
                 }
                 ui.label(r.kind);
                 ui.label(if r.git { "git" } else { "-" });
                 if r.local {
-                    ui.label(RichText::new("yes").color(C_OK_TEXT));
+                    ui.label(RichText::new("yes").color(self.pal.ok_text));
                 } else {
-                    ui.label(RichText::new("no").color(C_DIM));
+                    ui.label(RichText::new("no").color(self.pal.dim));
                 }
-                ui.label(RichText::new(r.last_sync.clone().unwrap_or_else(|| "-".into())).color(C_DIM));
+                ui.label(RichText::new(r.last_sync.clone().unwrap_or_else(|| "-".into())).color(self.pal.dim));
                 if r.conflicts > 0 {
-                    badge(ui, &format!("{}", r.conflicts), C_ATTENTION, Color32::WHITE);
+                    badge(ui, &format!("{}", r.conflicts), self.pal.attention);
                 } else {
-                    ui.label(RichText::new("-").color(C_DIM));
+                    ui.label(RichText::new("-").color(self.pal.dim));
                 }
-                ui.label(RichText::new(&r.compare).color(C_DIM));
+                ui.label(RichText::new(&r.compare).color(self.pal.dim));
                 let sel = self.selected.as_deref() == Some(r.id.as_str());
                 if ui.selectable_label(sel, RichText::new(shorten(&r.id, 34)).monospace()).on_hover_text(&r.id).clicked() {
                     clicked = Some(r.id.clone());
@@ -626,7 +726,7 @@ impl GuiApp {
         });
         if visible.is_empty() {
             ui.add_space(8.0);
-            ui.label(RichText::new("No projects match the filter.").color(C_DIM).italics());
+            ui.label(RichText::new("No projects match the filter.").color(self.pal.dim).italics());
         }
 
         if let Some(id) = clicked {
@@ -655,7 +755,7 @@ impl GuiApp {
 
         // Primary actions: sync / resync / open folders.
         ui.horizontal(|ui| {
-            if ui.add_enabled(!self.busy, primary("Sync")).on_hover_text("Sync this project now").clicked() {
+            if ui.add_enabled(!self.busy, primary(self.pal.accent_btn, "Sync")).on_hover_text("Sync this project now").clicked() {
                 let pid = id.clone();
                 let approve = self.approve_deletes;
                 self.run_job(&format!("syncing {pid}…"), move |p, c| {
@@ -762,7 +862,7 @@ impl GuiApp {
             }
             ui.checkbox(&mut self.unmap_delete_local, "delete local too")
                 .on_hover_text("Also remove the local folder on Unmap (refused on a protected root)");
-            if ui.button(RichText::new("Forget").color(C_ATTENTION)).on_hover_text("Retire globally (tombstone); reversible with Pull").clicked() {
+            if ui.button(RichText::new("Forget").color(self.pal.attention_text)).on_hover_text("Retire globally (tombstone); reversible with Pull").clicked() {
                 actions::forget(&self.paths, &id);
                 self.status_msg = format!("forgot {id}");
                 self.selected = None;
@@ -785,16 +885,19 @@ impl GuiApp {
         };
         let mut go = false;
         let mut cancel = false;
+        // Copy themed colours out before the closure (Palette is Copy; avoids
+        // borrowing self inside the frame closure).
+        let (warn_fill, text_col, btn_fill) = (self.pal.warn_surface, self.pal.text, self.pal.attention);
         ui.add_space(8.0);
         let warn = egui::Frame::default()
-            .fill(Color32::from_rgb(64, 38, 38))
+            .fill(warn_fill)
             .inner_margin(egui::Margin::same(10))
             .corner_radius(egui::CornerRadius::same(6));
         warn.show(ui, |ui| {
-            ui.label(RichText::new(&msg).color(C_TEXT).strong());
+            ui.label(RichText::new(&msg).color(text_col).strong());
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.add(egui::Button::new(RichText::new("Confirm").color(Color32::WHITE)).fill(C_ATTENTION)).clicked() {
+                if ui.add(egui::Button::new(RichText::new("Confirm").color(Color32::WHITE)).fill(btn_fill)).clicked() {
                     go = true;
                 }
                 if ui.button("Cancel").clicked() {
@@ -847,7 +950,7 @@ impl GuiApp {
         ui.add_space(8.0);
         ui.label(RichText::new(format!("Conflicts in {cid}:")).strong());
         if files.is_empty() {
-            ui.label(RichText::new("  (none)").color(C_DIM));
+            ui.label(RichText::new("  (none)").color(self.pal.dim));
             return;
         }
         let mut del: Option<PathBuf> = None;
@@ -857,7 +960,7 @@ impl GuiApp {
                     if ui.button("Open").on_hover_text("Reveal in Explorer").clicked() {
                         reveal_in_explorer(f);
                     }
-                    if ui.button(RichText::new("Delete").color(C_ATTENTION)).clicked() {
+                    if ui.button(RichText::new("Delete").color(self.pal.attention_text)).clicked() {
                         del = Some(f.clone());
                     }
                     ui.monospace(f.display().to_string());
@@ -875,7 +978,7 @@ impl GuiApp {
         ui.add_space(8.0);
         ui.label(RichText::new("Restore from a local archived version:").strong());
         if runs.is_empty() {
-            ui.label(RichText::new("  (no archived versions yet — try OneDrive version history)").color(C_DIM));
+            ui.label(RichText::new("  (no archived versions yet — try OneDrive version history)").color(self.pal.dim));
             return;
         }
         let mut pick: Option<(String, String)> = None;
@@ -917,7 +1020,7 @@ impl GuiApp {
     fn view_pending(&mut self, ui: &mut egui::Ui) {
         if self.pending.is_empty() {
             ui.add_space(8.0);
-            ui.label(RichText::new("No new projects awaiting a decision.").color(C_DIM));
+            ui.label(RichText::new("No new projects awaiting a decision.").color(self.pal.dim));
             return;
         }
         ui.label("New projects available to sync on this machine:");
@@ -926,7 +1029,7 @@ impl GuiApp {
         let mut skip: Option<String> = None;
         egui::Grid::new("pending").striped(true).num_columns(4).spacing([14.0, 10.0]).show(ui, |ui| {
             for h in ["NAME", "KIND", "PROJECT", ""] {
-                ui.label(RichText::new(h).color(C_DIM).small().strong());
+                ui.label(RichText::new(h).color(self.pal.dim).small().strong());
             }
             ui.end_row();
             for p in &self.pending {
@@ -934,7 +1037,7 @@ impl GuiApp {
                 ui.label(&p.kind);
                 ui.monospace(&p.id);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(!self.busy, primary("Activate")).clicked() {
+                    if ui.add_enabled(!self.busy, primary(self.pal.accent_btn, "Activate")).clicked() {
                         activate = Some(p.id.clone());
                     }
                     if ui.button("Skip").clicked() {
@@ -959,7 +1062,7 @@ impl GuiApp {
     fn view_retired(&mut self, ui: &mut egui::Ui) {
         if self.forgotten.is_empty() {
             ui.add_space(8.0);
-            ui.label(RichText::new("No retired (tombstoned) projects.").color(C_DIM));
+            ui.label(RichText::new("No retired (tombstoned) projects.").color(self.pal.dim));
             return;
         }
         ui.label("Retired projects — Revive re-activates and syncs them here:");
@@ -994,7 +1097,7 @@ impl GuiApp {
             ui.end_row();
         });
         ui.add_space(8.0);
-        if ui.add(primary("Add watch mapping")).clicked() {
+        if ui.add(primary(self.pal.accent_btn, "Add watch mapping")).clicked() {
             let (local, dest) = (self.watch_local.trim().to_string(), self.watch_dest.trim().to_string());
             if local.is_empty() || dest.is_empty() {
                 self.status_msg = "both folders are required".into();
@@ -1012,7 +1115,7 @@ impl GuiApp {
             self.load_settings();
         }
         ui.heading("Settings");
-        ui.label(RichText::new(r"Edits write %LOCALAPPDATA%\onedrive-sync\config.toml; discovery picks them up on the next refresh.").color(C_DIM).small());
+        ui.label(RichText::new(r"Edits write %LOCALAPPDATA%\onedrive-sync\config.toml; discovery picks them up on the next refresh.").color(self.pal.dim).small());
         ui.add_space(10.0);
 
         egui::Grid::new("set-paths").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -1021,7 +1124,7 @@ impl GuiApp {
                 ("OneDrive", self.paths.onedrive.display().to_string()),
                 ("Profile", self.paths.user_profile.display().to_string()),
             ] {
-                ui.label(RichText::new(k).color(C_DIM));
+                ui.label(RichText::new(k).color(self.pal.dim));
                 ui.monospace(v);
                 ui.end_row();
             }
@@ -1091,7 +1194,7 @@ impl GuiApp {
 
         ui.add_space(12.0);
         ui.horizontal(|ui| {
-            if ui.add(primary("Save settings")).clicked() {
+            if ui.add(primary(self.pal.accent_btn, "Save settings")).clicked() {
                 self.save_settings();
             }
             if ui.button("Reload").on_hover_text("Discard edits and reload from disk").clicked() {
@@ -1213,8 +1316,8 @@ fn install_fonts(ctx: &egui::Context) -> egui::FontFamily {
 /// Tuned theme: layered surfaces, rounded widgets, high-contrast text, generous
 /// spacing, comfortable click targets, and a readable type scale. `bold` is the
 /// heavier family installed by [`install_fonts`], used for headings and buttons.
-fn configure_style(ctx: &egui::Context, bold: egui::FontFamily) {
-    use egui::{CornerRadius, FontFamily::Proportional, FontId, Stroke, TextStyle};
+fn configure_style(ctx: &egui::Context, bold: egui::FontFamily, pal: Palette) {
+    use egui::{FontFamily::Proportional, FontId, TextStyle};
     let mut style = (*ctx.global_style()).clone();
     style.text_styles = [
         (TextStyle::Heading, FontId::new(20.0, bold.clone())),
@@ -1227,42 +1330,43 @@ fn configure_style(ctx: &egui::Context, bold: egui::FontFamily) {
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     style.spacing.button_padding = egui::vec2(12.0, 7.0);
     style.spacing.interact_size.y = 30.0;
+    style.visuals = make_visuals(pal);
+    ctx.set_global_style(style);
+}
 
-    let mut v = egui::Visuals::dark();
-    v.override_text_color = Some(C_TEXT);
-    v.panel_fill = C_BG;
-    v.window_fill = C_CARD;
+/// Visuals derived from a palette. Starts from egui's accessible light/dark
+/// defaults (so the per-state widget fills are sensible in BOTH themes) and
+/// overrides only the surfaces, accent, selection, corner radii, and the
+/// keyboard-focus ring — the parts that carry our identity and accessibility.
+fn make_visuals(pal: Palette) -> egui::Visuals {
+    use egui::{CornerRadius, Stroke};
+    let mut v = if pal.dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    v.override_text_color = Some(pal.text);
+    v.panel_fill = pal.bg;
+    v.window_fill = pal.card;
     v.window_corner_radius = CornerRadius::same(10);
     v.menu_corner_radius = CornerRadius::same(8);
-    v.selection.bg_fill = Color32::from_rgba_unmultiplied(74, 142, 240, 70);
-    v.selection.stroke = Stroke::new(1.0, C_ACCENT);
-    v.hyperlink_color = C_ACCENT;
-
-    // Rounded widgets with layered fills (buttons paint with weak_bg_fill).
+    let a = pal.accent;
+    v.selection.bg_fill = Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), if pal.dark { 70 } else { 60 });
+    v.selection.stroke = Stroke::new(1.0, a);
+    v.hyperlink_color = a;
     let cr = CornerRadius::same(7);
-    v.widgets.noninteractive.corner_radius = cr;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(44, 48, 57));
-    v.widgets.inactive.corner_radius = cr;
-    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(44, 48, 57);
-    v.widgets.inactive.bg_fill = Color32::from_rgb(44, 48, 57);
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(58, 63, 74));
-    v.widgets.hovered.corner_radius = cr;
-    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(58, 63, 74);
-    v.widgets.hovered.bg_fill = Color32::from_rgb(58, 63, 74);
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, C_ACCENT);
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.corner_radius = cr;
+    }
+    // Hover = 1px accent stroke; `active` is egui's keyboard-FOCUS state, so a 2px
+    // accent ring there is the visible focus indicator, distinct from hover.
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, a);
     v.widgets.hovered.expansion = 1.0;
-    // `active` is also the KEYBOARD-FOCUS state (egui renders a focused widget with
-    // these visuals). A 2px accent ring + brighter fill makes a Tab-focused control
-    // read as clearly focused, distinct from the 1px hover stroke above.
-    v.widgets.active.corner_radius = cr;
-    v.widgets.active.weak_bg_fill = Color32::from_rgb(70, 76, 90);
-    v.widgets.active.bg_fill = Color32::from_rgb(70, 76, 90);
-    v.widgets.active.bg_stroke = Stroke::new(2.0, C_ACCENT);
+    v.widgets.active.bg_stroke = Stroke::new(2.0, a);
     v.widgets.active.expansion = 1.0;
-    v.widgets.open.corner_radius = cr;
-
-    style.visuals = v;
-    ctx.set_global_style(style);
+    v
 }
 
 /// Launch the management window + tray (blocks on the event loop).
@@ -1281,8 +1385,16 @@ pub fn run_gui(paths: Paths, config: Config) -> eframe::Result {
         native_options,
         Box::new(move |cc| {
             let bold = install_fonts(&cc.egui_ctx);
-            configure_style(&cc.egui_ctx, bold);
-            Ok(Box::new(GuiApp::new(paths, config)))
+            // Resolve the theme: an explicit saved choice wins; "system" (the
+            // default) follows whatever light/dark eframe detected from the OS.
+            let dark = match config.theme.as_str() {
+                "light" => false,
+                "dark" => true,
+                _ => cc.egui_ctx.global_style().visuals.dark_mode,
+            };
+            let pal = if dark { Palette::dark() } else { Palette::light() };
+            configure_style(&cc.egui_ctx, bold.clone(), pal);
+            Ok(Box::new(GuiApp::new(paths, config, pal, bold)))
         }),
     )
 }
