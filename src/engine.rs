@@ -9,6 +9,7 @@ use crate::state::MachineState;
 use crate::{events, filter};
 use chrono::Utc;
 use md5::{Digest, Md5};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -139,15 +140,42 @@ pub fn bisync(
     // lock file sits beside the workdir, matching Invoke-OdsWithProjectLock.
     let lock_path = paths.bisync_dir().join(format!("{idh}.lock"));
     let _plock = crate::jsonio::lock_or_break(&lock_path, Duration::from_secs(600));
+    // rclone writes its own ERROR/NOTICE lines into the shared --log-file (set
+    // above) rather than stderr, so capturing "why" means tailing what it just
+    // appended there — mark the offset before spawning, read only the new bytes.
+    let log_start = std::fs::metadata(paths.log_file()).map(|m| m.len()).unwrap_or(0);
     let code = run_rclone(&rclone_path(paths), &args, timeout, paths, &project.id);
     drop(_plock);
+    let reason = tail_error_lines(&paths.log_file(), log_start);
 
     events::write_event(
         paths,
         "bisync",
-        serde_json::json!({"id": project.id, "code": code, "resync": do_resync, "dryrun": opts.dry_run}),
+        serde_json::json!({"id": project.id, "code": code, "resync": do_resync, "dryrun": opts.dry_run, "error": reason}),
     );
     code
+}
+
+/// The ERROR-level lines rclone appended to the shared sync.log during this run
+/// (bytes from `start_len` on), joined into a short human-readable reason for the
+/// GUI's Attention badge. Capped so a chatty failure can't bloat the event log.
+fn tail_error_lines(log_file: &Path, start_len: u64) -> String {
+    let Ok(mut f) = std::fs::File::open(log_file) else { return String::new() };
+    if f.seek(SeekFrom::Start(start_len)).is_err() {
+        return String::new();
+    }
+    let mut buf = String::new();
+    if f.read_to_string(&mut buf).is_err() {
+        return String::new();
+    }
+    let mut hits: Vec<&str> = buf.lines().filter(|l| l.to_uppercase().contains("ERROR")).collect();
+    hits.truncate(6);
+    let joined = hits.join(" | ");
+    if joined.chars().count() > 500 {
+        joined.chars().take(500).collect::<String>() + "…"
+    } else {
+        joined
+    }
 }
 
 fn run_rclone(rclone: &Path, args: &[String], timeout: Duration, paths: &Paths, id: &str) -> i32 {
