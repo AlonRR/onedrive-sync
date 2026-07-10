@@ -45,6 +45,9 @@ pub struct Config {
     /// GUI theme: "system" (follow the OS, default), "dark", or "light". Only the
     /// management window reads this; it has no effect on sync behaviour.
     pub theme: String,
+    /// GUI layout: which side the selected-project detail panel docks to —
+    /// "bottom" (default) or "right". Only the management window reads this.
+    pub drawer_side: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +90,7 @@ impl Default for Config {
             retry_max_wait_seconds: 120,
             defer_escalate_cycles: 5,
             theme: "system".to_string(),
+            drawer_side: "bottom".to_string(),
         }
     }
 }

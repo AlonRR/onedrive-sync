@@ -49,6 +49,9 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
+/// Window width below which the left nav rail collapses to icons (see `nav`).
+const NAV_COLLAPSE_WIDTH: f32 = 860.0;
+
 /// A complete theme. Every (foreground, background) pair a label can land on is
 /// verified >= WCAG-AA (4.5:1 text, 3:1 non-text); body text clears AAA (>= 7:1).
 /// Grounded in: WCAG 2.2 / Israel IS 5568 (== WCAG 2.0 AA) / US §508 (USWDS) for
@@ -165,6 +168,10 @@ struct Row {
     local: bool,
     status: String,
     attention: bool,
+    /// Why `attention` is set (the last failing bisync's rclone error text, or an
+    /// exit-code gloss) — shown in the detail drawer and "View conflicts" so a
+    /// failure that ISN'T an unresolved conflict copy still explains itself.
+    attention_reason: Option<String>,
     conflicts: usize,
     compare: String,
     last_sync: Option<String>,
@@ -208,6 +215,7 @@ struct GuiApp {
     zoom: f32,
     pal: Palette,
     bold: egui::FontFamily,
+    icon_font: egui::FontFamily,
     applied_dark: Option<bool>,
     logo: Option<egui::TextureHandle>,
     _tray: TrayIcon,
@@ -296,13 +304,15 @@ fn shorten(id: &str, max: usize) -> String {
 
 /// A colour+text status chip (never colour alone — the word carries the meaning
 /// too). The text colour is auto-picked for max contrast on `fill`, so the chip
-/// stays AA-legible whichever theme supplied the fill.
-fn badge(ui: &mut egui::Ui, text: &str, fill: Color32) {
-    ui.label(RichText::new(format!(" {text} ")).color(best_fg(fill)).background_color(fill).strong());
+/// stays AA-legible whichever theme supplied the fill. Returns the label's
+/// `Response` so callers (e.g. a fully-clickable project row) can fold it into a
+/// wider hit target.
+fn badge(ui: &mut egui::Ui, text: &str, fill: Color32) -> egui::Response {
+    ui.label(RichText::new(format!(" {text} ")).color(best_fg(fill)).background_color(fill).strong())
 }
 
 impl GuiApp {
-    fn new(paths: Paths, config: Config, pal: Palette, bold: egui::FontFamily) -> Self {
+    fn new(paths: Paths, config: Config, pal: Palette, bold: egui::FontFamily, icon_font: egui::FontFamily) -> Self {
         let menu = Menu::new();
         let show = MenuItem::new("Show window", true, None);
         let sync = MenuItem::new("Sync all now", true, None);
@@ -350,6 +360,7 @@ impl GuiApp {
             zoom: 1.0,
             pal,
             bold,
+            icon_font,
             // Start unset so the per-frame guard applies the theme on the FIRST
             // ui() frame. eframe resets visuals to its own default after the
             // creation closure, clobbering a style set only at creation — so if
@@ -371,7 +382,7 @@ impl GuiApp {
         self.state = MachineState::load(&self.paths);
         let catalog = Catalog::load(&self.paths);
         let projects = discover(&self.paths, &self.config, &catalog);
-        let att = events::attention_ids(&self.paths);
+        let att_reasons = events::attention_reasons(&self.paths);
         let last_sync = events::last_sync_per_project(&self.paths);
 
         self.rows = projects
@@ -381,7 +392,8 @@ impl GuiApp {
                 git: p.git,
                 local: p.local.exists(),
                 status: self.state.status_of(&p.id).as_str().to_string(),
-                attention: att.iter().any(|a| a.eq_ignore_ascii_case(&p.id)),
+                attention: att_reasons.keys().any(|a| a.eq_ignore_ascii_case(&p.id)),
+                attention_reason: att_reasons.iter().find(|(a, _)| a.eq_ignore_ascii_case(&p.id)).map(|(_, r)| r.clone()),
                 conflicts: if p.local.exists() { conflicts::scan(p).len() } else { 0 },
                 compare: self.state.compare.get(&p.id).cloned().unwrap_or_else(|| self.config.compare_mode.clone()),
                 last_sync: last_sync.get(&p.id).map(|ts| ago(ts)),
@@ -457,6 +469,15 @@ impl GuiApp {
         self.config.theme = if to_dark { "dark" } else { "light" }.to_string();
         if let Err(e) = self.config.save(&self.paths) {
             self.status_msg = format!("theme not saved: {e}");
+        }
+    }
+
+    /// Flip the selected-project drawer between docking at the bottom and the
+    /// right, and persist the choice (mirrors `toggle_theme`).
+    fn toggle_drawer_side(&mut self) {
+        self.config.drawer_side = if self.config.drawer_side == "right" { "bottom" } else { "right" }.to_string();
+        if let Err(e) = self.config.save(&self.paths) {
+            self.status_msg = format!("layout not saved: {e}");
         }
     }
 
@@ -550,19 +571,35 @@ impl eframe::App for GuiApp {
         let status = egui::Frame::default().fill(self.pal.bar).inner_margin(egui::Margin::symmetric(14, 7));
         egui::Panel::bottom("statusbar").frame(status).show_inside(ui, |ui| self.statusbar(ui));
 
-        let nav = egui::Frame::default().fill(self.pal.nav).inner_margin(egui::Margin::symmetric(10, 14));
-        egui::Panel::left("nav").exact_size(172.0).resizable(false).frame(nav).show_inside(ui, |ui| self.nav(ui));
+        // Below this window width the nav rail collapses to a narrow icon rail
+        // (still real text under each icon — see `icon_label`) so the central
+        // content keeps usable room instead of being squeezed by a fixed 172px
+        // rail on a small window.
+        let nav_collapsed = ctx.content_rect().width() < NAV_COLLAPSE_WIDTH;
+        let nav = egui::Frame::default().fill(self.pal.nav).inner_margin(egui::Margin::symmetric(8, 14));
+        egui::Panel::left("nav")
+            .exact_size(if nav_collapsed { 68.0 } else { 172.0 })
+            .resizable(false)
+            .frame(nav)
+            .show_inside(ui, |ui| self.nav(ui, nav_collapsed));
 
-        // Selected-project detail as a fixed bottom drawer (actions stay visible
-        // instead of scrolling off the end of a long grid).
+        // Selected-project detail as a fixed drawer, docked bottom (default) or
+        // right per `config.drawer_side` (toggled from the titlebar) — actions
+        // stay visible instead of scrolling off the end of a long grid.
         if self.view == View::Projects && self.selected.is_some() {
             let drawer = egui::Frame::default().fill(self.pal.card).inner_margin(egui::Margin::symmetric(18, 12));
-            // Cap the drawer height and scroll inside it, so the inspect sections
+            // Cap the drawer size and scroll inside it, so the inspect sections
             // (clean / conflicts / versions / filter) stay reachable at the default
             // window size instead of clipping below the fold.
-            egui::Panel::bottom("detail").resizable(true).default_size(300.0).max_size(460.0).frame(drawer).show_inside(ui, |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.detail_panel(ui));
-            });
+            if self.config.drawer_side == "right" {
+                egui::Panel::right("detail").resizable(true).default_size(420.0).max_size(680.0).frame(drawer).show_inside(ui, |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.detail_panel(ui));
+                });
+            } else {
+                egui::Panel::bottom("detail").resizable(true).default_size(300.0).max_size(460.0).frame(drawer).show_inside(ui, |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.detail_panel(ui));
+                });
+            }
         }
 
         let central = egui::Frame::default().fill(self.pal.bg).inner_margin(egui::Margin::symmetric(18, 14));
@@ -621,6 +658,16 @@ impl GuiApp {
                     self.toggle_theme();
                 }
                 ui.separator();
+                // Layout: dock the selected-project detail panel bottom or right.
+                let (dlabel, dhover) = if self.config.drawer_side == "right" {
+                    ("Panel \u{2193} Bottom", "Dock the project details panel to the bottom")
+                } else {
+                    ("Panel \u{2192} Right", "Dock the project details panel to the right")
+                };
+                if ui.button(dlabel).on_hover_text(dhover).clicked() {
+                    self.toggle_drawer_side();
+                }
+                ui.separator();
                 // Global run actions.
                 if ui.add_enabled(!self.busy, primary(self.pal.accent_btn, "Sync all")).on_hover_text("Sync every active project now").clicked() {
                     self.run_all("syncing all…", false);
@@ -637,24 +684,64 @@ impl GuiApp {
         });
     }
 
-    fn nav(&mut self, ui: &mut egui::Ui) {
+    /// `collapsed`: below `NAV_COLLAPSE_WIDTH` the rail narrows to icon-above-
+    /// label buttons (still real text, never icon-only — see `icon_label`).
+    fn nav(&mut self, ui: &mut egui::Ui, collapsed: bool) {
         ui.add_space(2.0);
-        ui.label(RichText::new("VIEWS").size(11.0).color(self.pal.dim).strong());
-        ui.add_space(8.0);
-        self.nav_item(ui, View::Projects, "Projects".to_string());
-        let plabel = if self.pending.is_empty() { "Pending".to_string() } else { format!("Pending  ({})", self.pending.len()) };
-        self.nav_item(ui, View::Pending, plabel);
-        self.nav_item(ui, View::Retired, "Retired".to_string());
-        self.nav_item(ui, View::AddFolders, "Add folders".to_string());
-        self.nav_item(ui, View::Settings, "Settings".to_string());
+        if !collapsed {
+            ui.label(RichText::new("VIEWS").size(11.0).color(self.pal.dim).strong());
+            ui.add_space(8.0);
+        }
+        self.nav_item(ui, View::Projects, "Projects", icons::FOLDER, collapsed);
+        let plabel = if self.pending.is_empty() { "Pending".to_string() } else { format!("Pending ({})", self.pending.len()) };
+        self.nav_item(ui, View::Pending, &plabel, icons::CLOCK, collapsed);
+        self.nav_item(ui, View::Retired, "Retired", icons::DELETE, collapsed);
+        self.nav_item(ui, View::AddFolders, "Add folders", icons::ADD, collapsed);
+        self.nav_item(ui, View::Settings, "Settings", icons::SETTINGS, collapsed);
     }
 
-    fn nav_item(&mut self, ui: &mut egui::Ui, view: View, label: String) {
+    fn nav_item(&mut self, ui: &mut egui::Ui, view: View, label: &str, icon: char, collapsed: bool) {
         let selected = self.view == view;
-        let resp = ui.add_sized(
-            [ui.available_width(), 34.0],
-            egui::Button::selectable(selected, RichText::new(label).size(15.0)),
-        );
+        if !collapsed {
+            let text = icon_label(&self.icon_font, icon, label);
+            let resp = ui.add_sized([ui.available_width(), 34.0], egui::Button::selectable(selected, text)).on_hover_text(label);
+            if resp.clicked() {
+                self.view = view;
+            }
+            ui.add_space(3.0);
+            return;
+        }
+
+        // Collapsed rail: icon above a WRAPPING label, built the same way as
+        // `project_row` (Frame for layout + a manual interact region) instead
+        // of one mixed-font LayoutJob in a Button — a Button silently
+        // re-applies its own wrap width on top of a LayoutJob's, which ate our
+        // explicit icon/label line break (a real plain-text `ui.label` wraps
+        // correctly on its own, so this path doesn't need that trick at all).
+        let bg_id = ui.painter().add(egui::Shape::Noop);
+        let frame = egui::Frame::default().inner_margin(egui::Margin::symmetric(4, 6)).corner_radius(egui::CornerRadius::same(6));
+        let inner = frame.show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new(icon.to_string()).family(self.icon_font.clone()).size(18.0));
+                ui.add_space(2.0);
+                ui.label(RichText::new(label).size(10.5));
+            });
+        });
+        let rect = inner.response.rect;
+        let resp = ui.interact(rect, ui.id().with(("nav-collapsed", label)), egui::Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, label));
+        let fill = if selected {
+            Some(self.pal.accent_btn)
+        } else if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            Some(Color32::from_rgba_unmultiplied(self.pal.text.r(), self.pal.text.g(), self.pal.text.b(), if self.pal.dark { 18 } else { 10 }))
+        } else {
+            None
+        };
+        if let Some(c) = fill {
+            ui.painter().set(bg_id, egui::Shape::rect_filled(rect, egui::CornerRadius::same(6), c));
+        }
         if resp.clicked() {
             self.view = view;
         }
@@ -713,61 +800,113 @@ impl GuiApp {
         let visible: Vec<usize> = (0..self.rows.len())
             .filter(|&i| needle.is_empty() || self.rows[i].id.to_lowercase().contains(&needle))
             .collect();
-
-        let mut clicked: Option<String> = None;
-        egui::Grid::new("projects").striped(true).num_columns(8).spacing([14.0, 10.0]).show(ui, |ui| {
-            for h in ["STATUS", "KIND", "GIT", "LOCAL", "LAST SYNC", "CONFLICTS", "COMPARE", "PROJECT"] {
-                ui.label(RichText::new(h).color(self.pal.dim).small().strong());
-            }
-            ui.end_row();
-            for &i in &visible {
-                let r = &self.rows[i];
-                // status badge (attention overrides; both colour AND word).
-                if r.attention {
-                    badge(ui, "attention", self.pal.attention);
-                } else {
-                    let fill = match r.status.as_str() {
-                        "active" => self.pal.ok,
-                        "skip" => self.pal.skip,
-                        _ => self.pal.undecided,
-                    };
-                    badge(ui, &r.status, fill);
-                }
-                ui.label(r.kind);
-                ui.label(if r.git { "git" } else { "-" });
-                if r.local {
-                    ui.label(RichText::new("yes").color(self.pal.ok_text));
-                } else {
-                    ui.label(RichText::new("no").color(self.pal.dim));
-                }
-                ui.label(RichText::new(r.last_sync.clone().unwrap_or_else(|| "-".into())).color(self.pal.dim));
-                if r.conflicts > 0 {
-                    badge(ui, &format!("{}", r.conflicts), self.pal.attention);
-                } else {
-                    ui.label(RichText::new("-").color(self.pal.dim));
-                }
-                ui.label(RichText::new(&r.compare).color(self.pal.dim));
-                let sel = self.selected.as_deref() == Some(r.id.as_str());
-                if ui.selectable_label(sel, RichText::new(shorten(&r.id, 34)).monospace()).on_hover_text(&r.id).clicked() {
-                    clicked = Some(r.id.clone());
-                }
-                ui.end_row();
-            }
-        });
         if visible.is_empty() {
             ui.add_space(8.0);
             ui.label(RichText::new("No projects match the filter.").color(self.pal.dim).italics());
+            return;
         }
 
+        // A two-line "card" per project (primary line: badge + name; secondary
+        // line: self-labelled metadata that WRAPS) instead of a fixed-column
+        // grid — a rigid grid hides whichever columns don't fit once the detail
+        // drawer eats into the central width (e.g. docked right), with no
+        // affordance to reach them. Wrapping means every field is always
+        // reachable regardless of window/panel width. Pattern borrowed from
+        // Fork's commit list (metadata line + content line per row).
+        let mut clicked: Option<String> = None;
+        for &i in &visible {
+            self.project_row(ui, i, &mut clicked);
+        }
         if let Some(id) = clicked {
             self.select(&id);
         }
     }
 
+    /// One project as a fully-clickable two-line card; see `view_projects`.
+    fn project_row(&mut self, ui: &mut egui::Ui, idx: usize, clicked: &mut Option<String>) {
+        let r = &self.rows[idx];
+        let sel = self.selected.as_deref() == Some(r.id.as_str());
+        // Reserve a paint slot NOW (before content is drawn) so the row's
+        // hover/selection fill — set once the row's real extent is known,
+        // below — renders behind the row's own text instead of on top of it
+        // (same trick `egui::Frame` uses internally).
+        let bg_id = ui.painter().add(egui::Shape::Noop);
+
+        let frame = egui::Frame::default().inner_margin(egui::Margin::symmetric(10, 7));
+        let inner = frame.show(ui, |ui| {
+            ui.set_width(ui.available_width()); // claim the full row width, not just the content's
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    if r.attention {
+                        badge(ui, "attention", self.pal.attention);
+                    } else {
+                        let fill = match r.status.as_str() {
+                            "active" => self.pal.ok,
+                            "skip" => self.pal.skip,
+                            _ => self.pal.undecided,
+                        };
+                        badge(ui, &r.status, fill);
+                    }
+                    // Truncate (not wrap) so a long id can't blow out the card;
+                    // full id always available via the row's own tooltip below.
+                    ui.add(egui::Label::new(RichText::new(&r.id).strong().monospace().size(15.0)).truncate());
+                });
+                ui.add_space(3.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(r.kind).color(self.pal.dim).small());
+                    if r.git {
+                        ui.label(RichText::new("git").color(self.pal.dim).small());
+                    }
+                    ui.label(
+                        RichText::new(if r.local { "local: yes" } else { "local: no" })
+                            .color(if r.local { self.pal.ok_text } else { self.pal.dim })
+                            .small(),
+                    );
+                    if r.conflicts > 0 {
+                        badge(ui, &format!("{} conflict{}", r.conflicts, if r.conflicts == 1 { "" } else { "s" }), self.pal.attention);
+                    }
+                    ui.label(RichText::new(format!("compare: {}", r.compare)).color(self.pal.dim).small());
+                    let sync_text = r.last_sync.clone().map(|s| format!("synced {s}")).unwrap_or_else(|| "never synced".into());
+                    ui.label(RichText::new(sync_text).color(self.pal.dim).small());
+                });
+            });
+        });
+
+        // The card's own bounding rect (content can be narrower than the row,
+        // e.g. a short id) isn't wide enough to make a proper full-line hit
+        // target — force it out to the row's full available width.
+        let row_rect = egui::Rect::from_min_size(inner.response.rect.min, egui::vec2(ui.available_width(), inner.response.rect.height()));
+        // Keyed by the project's own id, not its list position — the position
+        // shifts across a refresh (re-sort, filter, discovery changes), and a
+        // position-keyed id would let this widget's focus/state incorrectly
+        // "follow" whatever project next lands on the same row index.
+        let row_id = ui.id().with(("project-row", &r.id));
+        let row = ui.interact(row_rect, row_id, egui::Sense::click()).on_hover_text(&r.id);
+        // A bare `ui.interact` region carries no accessible name on its own (unlike
+        // a real Button/Label widget) — without this, AccessKit/Narrator would skip
+        // right over what's meant to be the primary click target of the whole view.
+        row.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &r.id));
+        if row.clicked() {
+            *clicked = Some(r.id.clone());
+        }
+        let hl = if sel {
+            Some(Color32::from_rgba_unmultiplied(self.pal.accent.r(), self.pal.accent.g(), self.pal.accent.b(), if self.pal.dark { 55 } else { 40 }))
+        } else if row.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            Some(Color32::from_rgba_unmultiplied(self.pal.text.r(), self.pal.text.g(), self.pal.text.b(), if self.pal.dark { 18 } else { 10 }))
+        } else {
+            None
+        };
+        if let Some(c) = hl {
+            ui.painter().set(bg_id, egui::Shape::rect_filled(row_rect, egui::CornerRadius::same(6), c));
+        }
+        ui.add_space(2.0);
+    }
+
     fn detail_panel(&mut self, ui: &mut egui::Ui) {
         let id = self.selected.clone().unwrap();
         ui.horizontal(|ui| {
-            ui.heading(RichText::new(&id).monospace().size(17.0));
+            ui.heading(RichText::new(shorten(&id, 48)).monospace().size(17.0)).on_hover_text(&id);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("close").clicked() {
                     self.selected = None;
@@ -778,13 +917,30 @@ impl GuiApp {
             return;
         }
 
+        // Why this project needs attention — shown up front (not just buried in
+        // "View conflicts", which only lists unresolved conflict COPIES and stays
+        // empty when the failure was something else, e.g. a delete-brake trip).
+        if let Some(reason) = self.rows.iter().find(|r| r.id == id).filter(|r| r.attention).and_then(|r| r.attention_reason.clone()) {
+            ui.add_space(6.0);
+            let warn = egui::Frame::default()
+                .fill(self.pal.warn_surface)
+                .inner_margin(egui::Margin::same(8))
+                .corner_radius(egui::CornerRadius::same(6));
+            warn.show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    badge(ui, "attention", self.pal.attention);
+                    ui.label(RichText::new(reason).color(self.pal.text));
+                });
+            });
+        }
+
         // Pending destructive action: show a prominent confirm bar (two-click safety).
         self.confirm_bar(ui);
 
         ui.add_space(8.0);
 
         // Primary actions: sync / resync / open folders.
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(!self.busy, primary(self.pal.accent_btn, "Sync")).on_hover_text("Sync this project now").clicked() {
                 let pid = id.clone();
                 let approve = self.approve_deletes;
@@ -804,13 +960,15 @@ impl GuiApp {
             }
             ui.separator();
             if ui.button("Open local").on_hover_text("Open the local folder in Explorer").clicked() {
-                if let Some((local, _)) = self.project_paths(&id) {
-                    open_in_explorer(&local);
+                match self.project_paths(&id) {
+                    Some((local, _)) => open_in_explorer(&local),
+                    None => self.status_msg = format!("could not resolve local path for {id} (try Refresh)"),
                 }
             }
             if ui.button("Open OneDrive").on_hover_text("Open the OneDrive destination in Explorer").clicked() {
-                if let Some((_, dest)) = self.project_paths(&id) {
-                    open_in_explorer(&dest);
+                match self.project_paths(&id) {
+                    Some((_, dest)) => open_in_explorer(&dest),
+                    None => self.status_msg = format!("could not resolve OneDrive path for {id} (try Refresh)"),
                 }
             }
         });
@@ -820,7 +978,7 @@ impl GuiApp {
         ui.add_space(8.0);
 
         // Per-project settings.
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Compare:");
             egui::ComboBox::from_id_salt("compare").selected_text(&self.sel_compare).show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.sel_compare, "modtime".to_string(), "modtime (fast)");
@@ -843,12 +1001,14 @@ impl GuiApp {
         ui.add_space(8.0);
 
         // Inspect: conflicts / generated filter / version history (each a toggle).
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("View conflicts").on_hover_text("List unresolved rclone conflict copies").clicked() {
                 if self.conflict_view.is_some() {
                     self.conflict_view = None;
                 } else if let Some(p) = self.find_project(&id) {
                     self.conflict_view = Some((id.clone(), conflicts::scan(&p)));
+                } else {
+                    self.status_msg = format!("could not find project {id} (try Refresh)");
                 }
             }
             if ui.button("Show filter").on_hover_text("Show the generated rclone filter for this project").clicked() {
@@ -856,6 +1016,8 @@ impl GuiApp {
                     self.filter_text = None;
                 } else if let Some(p) = self.find_project(&id) {
                     self.filter_text = Some(crate::filter::generate(&p, &self.config));
+                } else {
+                    self.status_msg = format!("could not find project {id} (try Refresh)");
                 }
             }
             if ui.button("Versions…").on_hover_text("Restore this project from a local archived version").clicked() {
@@ -873,6 +1035,8 @@ impl GuiApp {
                         Ok(scan) => self.clean_scan = Some((id.clone(), scan)),
                         Err(e) => self.status_msg = e,
                     }
+                } else {
+                    self.status_msg = format!("could not find project {id} (try Refresh)");
                 }
             }
         });
@@ -880,7 +1044,7 @@ impl GuiApp {
         ui.add_space(8.0);
 
         // Lifecycle actions.
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(!self.busy, egui::Button::new("Pull")).on_hover_text("Activate + sync here").clicked() {
                 let pid = id.clone();
                 self.run_job(&format!("pulling {pid}…"), move |p, c| match actions::pull(p, c, &pid) {
@@ -1009,7 +1173,18 @@ impl GuiApp {
         ui.add_space(8.0);
         ui.label(RichText::new(format!("Conflicts in {cid}:")).strong());
         if files.is_empty() {
-            ui.label(RichText::new("  (none)").color(self.pal.dim));
+            // "attention" isn't always an unresolved conflict COPY — it's whatever
+            // the last real bisync's exit code says. Say so here instead of just
+            // "(none)", which used to leave an Attention badge unexplained.
+            match self.rows.iter().find(|r| r.id == cid).filter(|r| r.attention).and_then(|r| r.attention_reason.clone()) {
+                Some(reason) => {
+                    ui.label(RichText::new("  No unresolved conflict copies — but the last sync still needs attention:").color(self.pal.dim));
+                    ui.label(RichText::new(format!("  {reason}")).color(self.pal.attention_text));
+                }
+                None => {
+                    ui.label(RichText::new("  (none)").color(self.pal.dim));
+                }
+            }
             return;
         }
         let mut del: Option<PathBuf> = None;
@@ -1022,7 +1197,10 @@ impl GuiApp {
                     if ui.button(RichText::new("Delete").color(self.pal.attention_text)).clicked() {
                         del = Some(f.clone());
                     }
-                    ui.monospace(f.display().to_string());
+                    // Truncate (not wrap) so a long path can't push the buttons
+                    // off-screen in the narrower right-docked panel; full path on hover.
+                    let text = f.display().to_string();
+                    ui.add(egui::Label::new(RichText::new(&text).monospace()).truncate()).on_hover_text(&text);
                 });
             }
         });
@@ -1056,9 +1234,13 @@ impl GuiApp {
         egui::ScrollArea::vertical().max_height(150.0).id_salt("clean").show(ui, |ui| {
             for it in &scan.items {
                 ui.horizontal(|ui| {
+                    // Fixed-width cells FIRST, truncating path LAST — a Label with
+                    // .truncate() only knows the width left in the row at the point
+                    // it's added, so anything meant to still show after it must be
+                    // placed before it.
                     ui.label(RichText::new(if it.is_dir { "DIR " } else { "file" }).color(mono).monospace().small());
-                    ui.monospace(&it.rel);
                     ui.label(RichText::new(human_bytes(it.bytes)).color(dim).small());
+                    ui.add(egui::Label::new(RichText::new(&it.rel).monospace()).truncate()).on_hover_text(&it.rel);
                 });
             }
         });
@@ -1475,7 +1657,11 @@ impl GuiApp {
 /// for headings/buttons — Segoe UI Semibold if present, else the regular
 /// proportional family. Falls back silently to egui's defaults if the font
 /// files are missing (we read the OS-installed copies, we don't bundle them).
-fn install_fonts(ctx: &egui::Context) -> egui::FontFamily {
+/// Installs body/heading/mono fonts plus the icon font, returning (bold,
+/// icons). `icons` is Segoe MDL2 Assets — the Windows system icon font, whose
+/// glyphs live at PUA codepoints (see the `icons` module below) — read
+/// straight from the OS like the others, so no icon assets are bundled.
+fn install_fonts(ctx: &egui::Context) -> (egui::FontFamily, egui::FontFamily) {
     use egui::FontFamily;
     fn add(fonts: &mut egui::FontDefinitions, key: &str, file: &str) -> bool {
         match std::fs::read(format!(r"C:\Windows\Fonts\{file}")) {
@@ -1490,6 +1676,7 @@ fn install_fonts(ctx: &egui::Context) -> egui::FontFamily {
     let have_regular = add(&mut fonts, "segoe", "segoeui.ttf"); // regular (400), NOT Light
     let have_semibold = add(&mut fonts, "segoe-sb", "seguisb.ttf"); // semibold (600)
     let have_mono = add(&mut fonts, "consolas", "consola.ttf");
+    let have_icons = add(&mut fonts, "mdl2", "segmdl2.ttf");
     if have_regular {
         fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "segoe".into());
     }
@@ -1503,8 +1690,52 @@ fn install_fonts(ctx: &egui::Context) -> egui::FontFamily {
     } else {
         FontFamily::Proportional
     };
+    // Fall back to the body font (renders "tofu" boxes, not a crash) if
+    // Segoe MDL2 Assets is somehow missing — every icon call site also passes
+    // real label text alongside the glyph, so the control stays usable either way.
+    let icons = if have_icons {
+        let fam = FontFamily::Name("icons".into());
+        fonts.families.insert(fam.clone(), vec!["mdl2".into()]);
+        fam
+    } else {
+        FontFamily::Proportional
+    };
     ctx.set_fonts(fonts);
-    bold
+    (bold, icons)
+}
+
+/// Segoe MDL2 Assets glyph codepoints used for nav icons (verified against
+/// Microsoft's Segoe Fluent Icons font reference — see
+/// https://learn.microsoft.com/windows/apps/design/style/segoe-fluent-icons-font).
+mod icons {
+    pub const FOLDER: char = '\u{E8B7}'; // Projects
+    pub const CLOCK: char = '\u{E823}'; // Pending (MDL2 "Recent")
+    pub const DELETE: char = '\u{E74D}'; // Retired (trash/tombstone)
+    pub const ADD: char = '\u{E710}'; // Add folders
+    pub const SETTINGS: char = '\u{E713}'; // Settings (gear)
+}
+
+/// Icon glyph + label side by side as one `WidgetText`, so a nav button is
+/// never icon-only (AccessKit's accessible name comes from visible text — see
+/// the module docs at the top of this file) while still getting a real icon.
+/// Colours are left as `Color32::PLACEHOLDER` so the button paints them with
+/// its own state colour (selected/hovered/inactive), exactly like a
+/// plain-text button — see `egui::WidgetText`'s docs on `PLACEHOLDER`. Only
+/// used for the expanded nav rail; the collapsed rail builds its icon-above-
+/// label layout separately (see `nav_item`) since a Button silently
+/// re-applies its own wrap width on top of a LayoutJob's, which doesn't play
+/// well with a forced line break between two differently-sized sections.
+fn icon_label(icon_family: &egui::FontFamily, icon: char, label: &str) -> egui::WidgetText {
+    let mut job = egui::text::LayoutJob::default();
+    let plain = |size: f32, family: egui::FontFamily| egui::TextFormat {
+        font_id: egui::FontId::new(size, family),
+        color: Color32::PLACEHOLDER,
+        ..Default::default()
+    };
+    job.append(&icon.to_string(), 0.0, plain(16.0, icon_family.clone()));
+    job.append("  ", 0.0, plain(11.0, egui::FontFamily::Proportional));
+    job.append(label, 0.0, plain(15.0, egui::FontFamily::Proportional));
+    egui::WidgetText::LayoutJob(job.into())
 }
 
 /// Tuned theme: layered surfaces, rounded widgets, high-contrast text, generous
@@ -1567,10 +1798,12 @@ fn make_visuals(pal: Palette) -> egui::Visuals {
 pub fn run_gui(paths: Paths, config: Config) -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            // Sized so the 8-column project grid fits without horizontal scroll at the
-            // default size; shrinking below this scrolls rather than clips.
+            // Sized so the project list and a bottom-docked drawer fit comfortably
+            // at the default size; the layout reflows rather than clips below this.
             .with_inner_size([1260.0, 740.0])
-            .with_min_inner_size([1000.0, 560.0])
+            // Low enough that the nav rail's auto-collapse (see `NAV_COLLAPSE_WIDTH`)
+            // is actually reachable by shrinking the window, not just theoretical.
+            .with_min_inner_size([720.0, 480.0])
             .with_icon(egui::IconData { rgba: icon::rgba(256, icon::BRAND), width: 256, height: 256 }),
         ..Default::default()
     };
@@ -1578,7 +1811,7 @@ pub fn run_gui(paths: Paths, config: Config) -> eframe::Result {
         "OneDrive Sync",
         native_options,
         Box::new(move |cc| {
-            let bold = install_fonts(&cc.egui_ctx);
+            let (bold, icons) = install_fonts(&cc.egui_ctx);
             // Resolve the theme: an explicit saved choice wins; "system" (the
             // default) follows whatever light/dark eframe detected from the OS.
             let dark = match config.theme.as_str() {
@@ -1588,7 +1821,7 @@ pub fn run_gui(paths: Paths, config: Config) -> eframe::Result {
             };
             let pal = if dark { Palette::dark() } else { Palette::light() };
             configure_style(&cc.egui_ctx, bold.clone(), pal);
-            Ok(Box::new(GuiApp::new(paths, config, pal, bold)))
+            Ok(Box::new(GuiApp::new(paths, config, pal, bold, icons)))
         }),
     )
 }
