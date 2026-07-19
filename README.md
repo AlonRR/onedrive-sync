@@ -1,10 +1,7 @@
 # ods
 
 Two-way OneDrive sync for code folders, built on **rclone bisync + git**. One small
-native binary: engine, CLI, management GUI, and system tray. A Rust rewrite of a
-PowerShell tool, chosen to eliminate three structural problems of the original stack —
-PowerShell's dynamic-scope crashes, the WPF re-entrancy crashes, and the per-run script
-re-parse overhead.
+native Rust binary: engine, CLI, management GUI, and system tray.
 
 `rclone` and `git` do the real work as subprocesses; `ods` orchestrates: discovers
 projects, generates per-repo filters, runs bisync with a delete-brake and a git health
@@ -24,7 +21,7 @@ Or, from a clone, install prebuilt binaries instead of building:
 
 ```powershell
 scripts\install.ps1 -FromRelease          # latest release
-scripts\install.ps1 -Version v0.1.0        # a specific release
+scripts\install.ps1 -Version v0.2.0        # a specific release
 ```
 
 Either way `ods.exe` + `ods-gui.exe` land in `%LOCALAPPDATA%\ods`, the tray starts, the
@@ -40,7 +37,7 @@ Two different ways to remove it, for two different purposes:
   `%LOCALAPPDATA%\ods` itself.
 
 **Cutting a release:** `.github/workflows/release.yml` builds the binaries and publishes a
-Release on any `v*.*.*` tag — `git tag v0.1.0 && git push origin v0.1.0`. (Publish to
+Release on any `v*.*.*` tag — `git tag v0.2.0 && git push origin v0.2.0`. (Publish to
 winget afterward with `wingetcreate` against the new release assets, if desired.)
 
 ## Build from source
@@ -67,11 +64,13 @@ ods forget <id>          # retire globally (tombstone); reversible with pull
 ods add-watch <local> <dest>      # map a local folder to an arbitrary OneDrive dest
 ods restore <id> [--file F] [--at T]   # restore from the local version archive
 ods conflicts            # list unresolved conflict files
+ods clean <id> [--yes]   # delete filtered files (e.g. node_modules) from OneDrive
 ods discover             # interactively choose which available projects to sync
 ods pause | ods resume   # pause/resume the scheduled sync (flag file)
 ods filter <id>          # print the generated rclone filter (for validation)
 ods diag                 # write a diagnostic bundle to %TEMP%
 ods gui                  # management window + tray
+ods uninstall            # remove tasks, shortcut, Installed Apps entry, and the install dir
 ```
 
 ## Layout
@@ -91,4 +90,5 @@ ods gui                  # management window + tray
 | `events` | JSONL event log + sync.log |
 | `gui` | egui management window + tray |
 
-See `MIGRATION.md` for parity validation and the cutover plan.
+See `CHANGELOG.md` for what shipped in each release, and `MIGRATION.md` for the
+Rust-port parity validation record.

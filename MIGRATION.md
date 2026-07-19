@@ -1,12 +1,11 @@
-# ods (Rust) — status & migration plan
+# ods (Rust) — parity validation record
 
-A from-scratch Rust port of the PowerShell onedrive-sync tool: one ~10 MB native
-binary that is the engine, CLI, management GUI, and tray. `rclone` and `git` stay
-subprocesses. No PowerShell host, so the dynamic-scope crash class is gone; no WPF,
-so the re-entrancy crash class is gone; no per-run script re-parse, so the overhead
-is gone.
+The Rust rewrite's cutover is complete (`install.ps1` has cut every machine over
+since `v0.1.0`); this doc is the record of what was validated against the
+PowerShell tool during that port, kept for reference. For current behavior see
+`README.md` / `CLAUDE.md`; for what shipped in each release see `CHANGELOG.md`.
 
-## What's done (and proven against the PowerShell tool on real data)
+## What was validated against the PowerShell tool on real data
 
 | Area | Validation |
 |---|---|
@@ -36,27 +35,19 @@ and the version-prune newest-run guard.
   it updates by swapping the `.exe` (the installer copies `target\release`), so
   there is nothing to stage. No equivalent is needed.
 
-## Cutover (do this when YOU are ready — not before)
+## Cutover — complete
 
-The PowerShell tool is the proven one. Don't flip the schedule until the Rust tool has
-shadow-run for a while:
+`scripts/install.ps1` automates what this section used to describe manually: it
+registers `ods-sync` (every 30 min + at logon) and `ods-tray` (at logon), then
+disables (not deletes) the old `OneDriveCodeSync` / `OneDriveCodeSyncTray`
+PowerShell tasks, aborting the swap rather than leaving both schedules live.
 
-1. **Shadow.** For a week or two, periodically run `ods sync --dry-run` right after a
-   real PowerShell run and confirm the summaries still match (they do today).
-2. **Swap the schedule.** Register a scheduled task running
-   `ods.exe sync` every 30 min + at logon, and `ods.exe gui` at logon; then disable the
-   `OneDriveCodeSync` / `OneDriveCodeSyncTray` PowerShell tasks. Keep them (don't delete)
-   so you can roll back instantly.
-3. **Watch the first few real runs** in the GUI / `ods status`.
+Rollback: `scripts\uninstall.ps1` removes the `ods` tasks and re-enables the
+PowerShell ones. A full removal (no PowerShell fallback) is `ods uninstall` — see
+`README.md`.
 
-Rollback is just: re-enable the two PowerShell tasks, disable the `ods` ones.
+## Repo hygiene
 
-## Repo hygiene (your "local repo, sync via the tool" idea)
-
-- This repo lives **outside OneDrive** (`C:\Users\…\ods`) so its 1.7 GB `target/` never
-  churns a sync; `target/` is gitignored and is in the tool's `exclude_dirs` anyway.
-- To dogfood, register this repo's **source** as a watch project so the tool syncs it
-  up (it will skip `target/`).
-- Likewise, move the **onedrive-sync** tool's own repo out of
-  `…\OneDrive\Tools\onedrive-sync` into a local repo synced the same way, so git and
-  OneDrive stop contending over the same files.
+This repo's own source is itself a synced project (see `CLAUDE.md`) — it lives
+under a local root that the tool mirrors into OneDrive, so `target/` (gitignored,
+and in the tool's `exclude_dirs`) never churns a sync.

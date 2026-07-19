@@ -1,10 +1,28 @@
 # Changelog
 
-All notable changes to onedrive-sync (`ods`). This repo continues the original
-PowerShell project; the `v1.0-powershell` tag marks the last PowerShell release,
-recorded under `[0.1.0]` below.
+All notable changes to onedrive-sync (`ods`) — the native Rust engine, CLI,
+management GUI, and tray. This repo continues an earlier PowerShell tool's git
+history; that pre-rewrite history is summarized at the bottom, under the
+`v1.0-powershell` tag.
 
-## [Unreleased] — Rust rewrite (`ods`)
+## [0.2.0] — 2026-07-19
+
+### Added
+- **`ods uninstall`:** a native subcommand that stops the tray, unregisters the
+  scheduled tasks, and removes the Start Menu shortcut and install directory.
+  Wired into a new Windows Settings > Apps > Installed apps entry (via
+  `install.ps1`, HKCU, no elevation) so the app can be removed the normal way, not
+  just rolled back to the PowerShell tool.
+- **GUI:** reflowing project-row cards (no more hidden columns when the detail
+  panel docks right), a bottom/right dockable detail panel, nav-rail icons with
+  responsive collapse on narrow windows, and an explanation shown for why a
+  project needs "Attention" instead of a silent badge.
+
+### Fixed
+- A failed bisync now captures rclone's actual error text into the event log,
+  instead of leaving "needs attention" unexplained.
+
+## [0.1.0] — 2026-06-27 — Rust rewrite (`ods`)
 
 A from-scratch Rust port of the PowerShell tool into one ~10 MB native binary
 (engine + CLI + management GUI + tray). `rclone` and `git` stay subprocesses. No
@@ -34,7 +52,7 @@ gone), no per-run script re-parse.
 
 ---
 
-## [0.1.0] — 2026-06-10 (PowerShell)
+## Pre-rewrite: PowerShell tool (tag `v1.0-powershell`, 2026-06-10)
 
 Initial rewrite from the one-way `robocopy /MIR` push to a 2-way, versioned,
 selective, multi-machine sync built on `rclone bisync`.
