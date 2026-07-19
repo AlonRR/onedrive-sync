@@ -27,9 +27,17 @@ scripts\install.ps1 -FromRelease          # latest release
 scripts\install.ps1 -Version v0.1.0        # a specific release
 ```
 
-Either way `ods.exe` + `ods-gui.exe` land in `%LOCALAPPDATA%\ods`, the tray starts, and
-the `ods-sync` (logon + every 30 min) and `ods-tray` (logon) tasks are registered. Roll
-back with `scripts\uninstall.ps1`. `rclone` + `git` still need to be on the machine.
+Either way `ods.exe` + `ods-gui.exe` land in `%LOCALAPPDATA%\ods`, the tray starts, the
+`ods-sync` (logon + every 30 min) and `ods-tray` (logon) tasks are registered, and a
+Start Menu shortcut + a Settings > Apps > Installed apps entry are created (both
+per-user, no elevation). `rclone` + `git` still need to be on the machine.
+
+Two different ways to remove it, for two different purposes:
+- `scripts\uninstall.ps1` — rolls back to the old PowerShell tool (re-enables its
+  scheduled tasks); leaves the `ods` binaries in place.
+- `ods uninstall`, or Settings > Apps > Installed apps > ods > Uninstall — fully
+  removes ods: scheduled tasks, Start Menu shortcut, Installed Apps entry, and
+  `%LOCALAPPDATA%\ods` itself.
 
 **Cutting a release:** `.github/workflows/release.yml` builds the binaries and publishes a
 Release on any `v*.*.*` tag — `git tag v0.1.0 && git push origin v0.1.0`. (Publish to

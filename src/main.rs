@@ -80,10 +80,26 @@ enum Cmd {
     Diag,
     /// Open the management window + system tray.
     Gui,
+    /// Remove the scheduled tasks, Start Menu shortcut, and Installed Apps entry,
+    /// then delete %LOCALAPPDATA%\ods. This is the target Settings > Apps launches;
+    /// run it directly to fully remove ods the same way.
+    Uninstall,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Uninstall deliberately skips Paths::discover(), which requires a signed-in
+    // OneDrive client — every other subcommand needs that, but a broken OneDrive
+    // sign-in is a plausible reason someone reaches for uninstall in the first place.
+    if let Cmd::Uninstall = cli.cmd {
+        if let Err(e) = uninstall() {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     let paths = Paths::discover()?;
     let config = Config::load(&paths)?;
 
@@ -91,6 +107,83 @@ fn main() -> Result<()> {
         eprintln!("{e}");
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// Remove ods's Windows integration for the current user: stop the tray, unregister
+/// the scheduled tasks, delete the Start Menu shortcut and the "Installed Apps"
+/// registry entry, then self-delete %LOCALAPPDATA%\ods (which holds this very exe).
+fn uninstall() -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    let local = std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA is not set".to_string())?;
+    let dir = std::path::Path::new(&local).join("ods");
+
+    println!("Stopping ods-gui...");
+    let _ = Command::new("taskkill").args(["/F", "/IM", "ods-gui.exe"]).output();
+
+    // A task registered by install.ps1 is owned by whoever was elevated the first
+    // time it was created (install.ps1 itself only gets away without elevation when
+    // an already-current task lets it skip re-registration) — so deleting it can
+    // need elevation even though the user who owns ods never needed it to sync.
+    // Check each result for real instead of assuming success.
+    let mut tasks_removed = true;
+    for task in ["ods-sync", "ods-tray"] {
+        match Command::new("schtasks").args(["/Delete", "/TN", task, "/F"]).output() {
+            Ok(out) if out.status.success() => println!("removed scheduled task {task}"),
+            Ok(out) => {
+                tasks_removed = false;
+                println!("could not remove scheduled task {task}: {}", String::from_utf8_lossy(&out.stderr).trim());
+            }
+            Err(e) => {
+                tasks_removed = false;
+                println!("could not remove scheduled task {task}: {e}");
+            }
+        }
+    }
+
+    // Don't touch anything else if the tasks are still there: the tasks and
+    // UninstallString both point at the files in `dir`, so deleting it now would
+    // strand a live scheduled task with no exe to run, and no way to re-run
+    // `ods uninstall` to finish the job.
+    if !tasks_removed {
+        println!();
+        println!("Scheduled tasks need an elevated shell to remove (same as install.ps1's");
+        println!("schedule swap). Nothing else was changed — re-run 'ods uninstall' from an");
+        println!("administrator prompt to finish.");
+        return Err("uninstall incomplete: scheduled tasks need elevation".to_string());
+    }
+
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let shortcut = std::path::Path::new(&appdata)
+            .join(r"Microsoft\Windows\Start Menu\Programs\ods (OneDrive Sync).lnk");
+        let _ = std::fs::remove_file(&shortcut);
+    }
+
+    let _ = Command::new("reg")
+        .args(["delete", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\ods", "/f"])
+        .output();
+    println!("removed the Installed Apps entry");
+
+    // This exe's own file lives inside `dir`, so it can't remove the directory while
+    // running (the file is locked). Hand off to a short-lived detached helper that
+    // waits for this process to exit, then deletes the whole directory. `ping`, not
+    // `timeout`, for the delay — `timeout.exe` refuses to run with redirected stdin,
+    // which is exactly how Windows launches an UninstallString.
+    let script = format!("ping -n 3 127.0.0.1 >nul & rmdir /s /q \"{}\"", dir.display());
+    let _ = Command::new("cmd")
+        .args(["/C", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn();
+
+    println!("ods uninstalled.");
     Ok(())
 }
 
@@ -282,6 +375,7 @@ fn dispatch(cmd: Cmd, paths: &Paths, config: &Config) -> Result<(), String> {
         Cmd::Gui => {
             ods::gui::run_gui(paths.clone(), config.clone()).map_err(|e| e.to_string())?;
         }
+        Cmd::Uninstall => unreachable!("main() handles Uninstall before Paths::discover()"),
     }
     Ok(())
 }

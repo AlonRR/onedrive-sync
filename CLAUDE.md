@@ -51,6 +51,23 @@ captures the non-obvious things; the **code is the source of truth**, and `READM
   OneDrive copy `git status` / `git clean` lie until you `git reset` to rebuild the index
   from HEAD — cleaning against the stale index would delete the wrong files.
 
+## Scheduled-task ACL gotcha (Windows)
+- `ods-sync`/`ods-tray` are registered via `Register-ScheduledTask` with an explicit
+  `-Principal` (`RunLevel Limited`), non-elevated — that part genuinely needs no
+  elevation. But **once a task exists this way, deleting/disabling/replacing it can
+  need elevation even for the same user who created it and even for a plain
+  non-admin task** — confirmed on this machine: `schtasks /Delete`, `/Change
+  /Disable`, and `Unregister-ScheduledTask` all fail `Access is denied` non-elevated,
+  while `Register-ScheduledTask -Force` against an *already-current* task silently
+  skips instead of hitting the same wall (see `Register-OdsTask` in install.ps1).
+  Check `Get-Task...GetSecurityDescriptor` if this resurfaces — the DACL can end up
+  with the task owned by `BA` (Builtin Administrators) and the actual user granted
+  only `FR` (read), a state that's sticky once it happens. `ods uninstall`
+  (`src/main.rs`) handles this defensively: it checks the real exit status of the
+  delete and refuses to touch the Start Menu shortcut / registry entry / install dir
+  if task removal failed, so a partial run never strands the very exe the orphaned
+  tasks and the Settings "Uninstall" button still point at.
+
 ## GUI (egui/eframe)
 - The `eframe::App` impl uses `fn ui(&mut self, …)` (not `update`); panels via
   `Panel::top/bottom/left(...).show_inside`, sizing with `default_size`/`max_size` (NOT the

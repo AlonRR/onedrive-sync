@@ -92,5 +92,37 @@ $a2 = New-ScheduledTaskAction -Execute $guiExe
 $s2 = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable
 Register-OdsTask 'ods-tray' (New-ScheduledTask -Action $a2 -Trigger (New-ScheduledTaskTrigger -AtLogOn) -Settings $s2 -Principal $prin) $guiExe 'logon'
 
+# Start Menu shortcut (per-user, no elevation) + Settings > Apps entry (HKCU, no
+# elevation). Both point at the exes in $dir, so no separate .ico or copied script
+# is needed — DisplayIcon/IconLocation reference ods-gui.exe's own embedded icon,
+# and UninstallString runs the native `ods uninstall` subcommand directly.
+$startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+$shortcut = Join-Path $startMenu 'ods (OneDrive Sync).lnk'
+$wsh = New-Object -ComObject WScript.Shell
+$sc = $wsh.CreateShortcut($shortcut)
+$sc.TargetPath = $guiExe
+$sc.WorkingDirectory = $dir
+$sc.IconLocation = "$guiExe,0"
+$sc.Description = 'ods - OneDrive two-way code sync'
+$sc.Save()
+Write-Host "Start Menu shortcut -> $shortcut" -ForegroundColor Green
+
+$verOut = & $odsExe --version 2>$null
+$version = if ($verOut -match '(\d+\.\d+\.\d+)') { $matches[1] } else { '0.0.0' }
+$sizeKb = [math]::Round(((Get-Item $odsExe).Length + (Get-Item $guiExe).Length) / 1KB)
+$uninstKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ods'
+New-Item -Path $uninstKey -Force | Out-Null
+Set-ItemProperty -Path $uninstKey -Name DisplayName -Value 'ods (OneDrive Sync)'
+Set-ItemProperty -Path $uninstKey -Name DisplayVersion -Value $version
+Set-ItemProperty -Path $uninstKey -Name Publisher -Value 'Alon Rabinowitz'
+Set-ItemProperty -Path $uninstKey -Name InstallLocation -Value $dir
+Set-ItemProperty -Path $uninstKey -Name DisplayIcon -Value "$guiExe,0"
+Set-ItemProperty -Path $uninstKey -Name UninstallString -Value "`"$odsExe`" uninstall"
+New-ItemProperty -Path $uninstKey -Name EstimatedSize -Value $sizeKb -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $uninstKey -Name NoModify -Value 1 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $uninstKey -Name NoRepair -Value 1 -PropertyType DWord -Force | Out-Null
+Write-Host "Installed Apps entry registered (v$version)" -ForegroundColor Green
+
 Write-Host ""
 Write-Host "ods is LIVE. PowerShell tasks disabled (not deleted). Roll back: scripts\uninstall.ps1" -ForegroundColor Green
+Write-Host "Full removal: 'ods uninstall', or Settings > Apps > Installed apps > ods." -ForegroundColor Green
