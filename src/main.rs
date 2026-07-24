@@ -84,16 +84,27 @@ enum Cmd {
     /// then delete %LOCALAPPDATA%\ods. This is the target Settings > Apps launches;
     /// run it directly to fully remove ods the same way.
     Uninstall,
+    /// Update to the latest release: re-run the online installer in a new window
+    /// (this exe can't overwrite itself while running, so the update runs detached).
+    Update,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Uninstall deliberately skips Paths::discover(), which requires a signed-in
-    // OneDrive client — every other subcommand needs that, but a broken OneDrive
-    // sign-in is a plausible reason someone reaches for uninstall in the first place.
+    // Uninstall and update deliberately skip Paths::discover(), which requires a
+    // signed-in OneDrive client — every other subcommand needs that, but neither
+    // removing nor re-installing ods has anything to do with the OneDrive sign-in
+    // (a broken sign-in is a plausible reason to reach for either in the first place).
     if let Cmd::Uninstall = cli.cmd {
         if let Err(e) = uninstall() {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if let Cmd::Update = cli.cmd {
+        if let Err(e) = update() {
             eprintln!("{e}");
             std::process::exit(1);
         }
@@ -169,6 +180,23 @@ fn uninstall() -> Result<(), String> {
         .output();
     println!("removed the Installed Apps entry");
 
+    // Strip %LOCALAPPDATA%\ods back out of the per-user PATH that install.ps1 added —
+    // otherwise a stale entry pointing at the about-to-be-deleted dir lingers. Edit the
+    // raw REG_EXPAND_SZ user Path in the registry (same store install.ps1 writes), which
+    // needs PowerShell to split/rejoin — `reg` alone can't filter one entry out.
+    let ps = "$p=(Get-ItemProperty -Path 'HKCU:\\Environment' -Name Path -ErrorAction SilentlyContinue).Path; \
+              if($p){ $d=Join-Path $env:LOCALAPPDATA 'ods'; \
+              $n=(@($p -split ';' | Where-Object { $_ -ne '' -and $_ -ne $d })) -join ';'; \
+              Set-ItemProperty -Path 'HKCU:\\Environment' -Name Path -Value $n -Type ExpandString }";
+    match Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
+        .output()
+    {
+        Ok(out) if out.status.success() => println!("removed ods from PATH"),
+        Ok(out) => println!("could not update PATH: {}", String::from_utf8_lossy(&out.stderr).trim()),
+        Err(e) => println!("could not update PATH: {e}"),
+    }
+
     // This exe's own file lives inside `dir`, so it can't remove the directory while
     // running (the file is locked). Hand off to a short-lived detached helper that
     // waits for this process to exit, then deletes the whole directory. `ping`, not
@@ -184,6 +212,32 @@ fn uninstall() -> Result<(), String> {
         .spawn();
 
     println!("ods uninstalled.");
+    Ok(())
+}
+
+/// Update to the latest release by re-running the online bootstrap. A running exe
+/// can't overwrite its own file on Windows, and this very process IS ods.exe — so we
+/// launch the installer in a NEW console, detached, and return immediately. Once this
+/// process exits (freeing the lock on ods.exe) the installer's copy step succeeds.
+fn update() -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+
+    // The same one-liner the README documents. The short sleep lets THIS process exit
+    // before install.ps1 tries to copy over ods.exe. `-NoExit` keeps the new window up
+    // so the result (or any error) stays visible.
+    let ps = "Start-Sleep -Seconds 2; \
+              irm https://raw.githubusercontent.com/AlonRR/onedrive-sync/main/scripts/get.ps1 | iex";
+    Command::new("powershell")
+        .args(["-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .spawn()
+        .map_err(|e| format!("failed to launch the updater: {e}"))?;
+
+    println!("Update started in a new window (downloads the latest release and re-installs).");
+    println!("This process is exiting so its own exe can be replaced.");
     Ok(())
 }
 
@@ -376,6 +430,7 @@ fn dispatch(cmd: Cmd, paths: &Paths, config: &Config) -> Result<(), String> {
             ods::gui::run_gui(paths.clone(), config.clone()).map_err(|e| e.to_string())?;
         }
         Cmd::Uninstall => unreachable!("main() handles Uninstall before Paths::discover()"),
+        Cmd::Update => unreachable!("main() handles Update before Paths::discover()"),
     }
     Ok(())
 }

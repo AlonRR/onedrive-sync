@@ -26,11 +26,13 @@ pub fn id_hash(id: &str) -> String {
         .to_string()
 }
 
-/// Bundled rclone if present, else `rclone` on PATH.
+/// The local rclone override if one was placed (see `Paths::rclone`), else plain
+/// `rclone` resolved off PATH — which is the normal case; the installer preflights
+/// rclone onto PATH rather than dropping a copy in the state dir.
 pub fn rclone_path(paths: &Paths) -> PathBuf {
-    let bundled = paths.rclone();
-    if bundled.exists() {
-        bundled
+    let overridden = paths.rclone();
+    if overridden.exists() {
+        overridden
     } else {
         PathBuf::from("rclone")
     }

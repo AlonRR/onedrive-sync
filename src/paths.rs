@@ -45,7 +45,9 @@ impl Paths {
         self.onedrive.join("Tools").join("onedrive-sync").join("mappings.json")
     }
 
-    /// Bundled rclone (installer drops it here); fall back to PATH if absent.
+    /// Optional local rclone override (`%LOCALAPPDATA%\onedrive-sync\rclone.exe`).
+    /// The installer does NOT place one here — normally `rclone` comes off PATH
+    /// (see `engine::rclone_path`); this only exists to pin a specific rclone.
     pub fn rclone(&self) -> PathBuf { self.local_root.join("rclone.exe") }
 }
 

@@ -24,17 +24,24 @@ scripts\install.ps1 -FromRelease          # latest release
 scripts\install.ps1 -Version v0.2.0        # a specific release
 ```
 
-Either way `ods.exe` + `ods-gui.exe` land in `%LOCALAPPDATA%\ods`, the tray starts, the
-`ods-sync` (logon + every 30 min) and `ods-tray` (logon) tasks are registered, and a
-Start Menu shortcut + a Settings > Apps > Installed apps entry are created (both
-per-user, no elevation). `rclone` + `git` still need to be on the machine.
+Either way `ods.exe` + `ods-gui.exe` land in `%LOCALAPPDATA%\ods`, that dir is added to
+your per-user PATH (so `ods <cmd>` works from any terminal — open a new one after
+installing), the tray starts, the `ods-sync` (logon + every 30 min) and `ods-tray`
+(logon) tasks are registered, and a Start Menu shortcut + a Settings > Apps > Installed
+apps entry are created (both per-user, no elevation).
+
+`rclone` + `git` are required at runtime; the installer preflights them and, if either is
+missing, installs it via `winget` (pass `-SkipDeps` to skip that). Downloaded release
+binaries are verified against their published SHA256 before anything runs.
+
+Already installed? `ods update` pulls the latest release and re-installs in place.
 
 Two different ways to remove it, for two different purposes:
 - `scripts\uninstall.ps1` — rolls back to the old PowerShell tool (re-enables its
   scheduled tasks); leaves the `ods` binaries in place.
 - `ods uninstall`, or Settings > Apps > Installed apps > ods > Uninstall — fully
-  removes ods: scheduled tasks, Start Menu shortcut, Installed Apps entry, and
-  `%LOCALAPPDATA%\ods` itself.
+  removes ods: scheduled tasks, Start Menu shortcut, Installed Apps entry, the PATH
+  entry, and `%LOCALAPPDATA%\ods` itself.
 
 **Cutting a release:** `.github/workflows/release.yml` builds the binaries and publishes a
 Release on any `v*.*.*` tag — `git tag v0.2.0 && git push origin v0.2.0`. (Publish to
@@ -70,7 +77,8 @@ ods pause | ods resume   # pause/resume the scheduled sync (flag file)
 ods filter <id>          # print the generated rclone filter (for validation)
 ods diag                 # write a diagnostic bundle to %TEMP%
 ods gui                  # management window + tray
-ods uninstall            # remove tasks, shortcut, Installed Apps entry, and the install dir
+ods update               # pull the latest release and re-install in place
+ods uninstall            # remove tasks, shortcut, Installed Apps entry, PATH entry, and the install dir
 ```
 
 ## Layout

@@ -5,6 +5,29 @@ management GUI, and tray. This repo continues an earlier PowerShell tool's git
 history; that pre-rewrite history is summarized at the bottom, under the
 `v1.0-powershell` tag.
 
+## [0.3.0] — 2026-07-24
+
+### Added
+- **`ods` is now on PATH.** `install.ps1` adds `%LOCALAPPDATA%\ods` to the per-user
+  PATH (registry-safe `REG_EXPAND_SZ`, idempotent, with a `WM_SETTINGCHANGE`
+  broadcast), so the documented CLI actually works from any terminal instead of only
+  via the full path. `ods uninstall` removes the entry again.
+- **Dependency preflight.** `install.ps1` checks for `rclone` + `git` and installs a
+  missing one via `winget` (`-SkipDeps` opts out), restoring the auto-install the
+  PowerShell tool had. No more first-sync failing silently because rclone isn't there.
+- **Checksum-verified downloads.** `install.ps1 -FromRelease` verifies each binary
+  against its published `.sha256` before running it (a mismatch aborts; an absent
+  sidecar, as on older releases, warns and skips).
+- **`ods update`:** re-runs the online installer in a detached console to pull the
+  latest release and swap the binaries in place (a running exe can't overwrite itself).
+
+### Fixed
+- Corrected the stale "installer bundles rclone here" comments in `paths.rs` /
+  `engine.rs` / `CLAUDE.md`: the local `rclone.exe` is an optional override only; the
+  normal path is `rclone` on PATH.
+- `install.ps1` / `get.ps1` are now pure ASCII — removes the latent
+  `powershell.exe -File` mis-parse from em-dashes in a no-BOM script.
+
 ## [0.2.0] — 2026-07-19
 
 ### Added
@@ -91,3 +114,8 @@ selective, multi-machine sync built on `rclone bisync`.
   multi-writer contention.
 - Secrets sync to OneDrive's cloud by choice (no encryption). Git LFS not yet
   supported (detected + warned). Symlinks not synced.
+
+<!-- Full changelog: version headings link to their GitHub compare/release view. -->
+[0.3.0]: https://github.com/AlonRR/onedrive-sync/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/AlonRR/onedrive-sync/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/AlonRR/onedrive-sync/releases/tag/v0.1.0

@@ -26,7 +26,9 @@ captures the non-obvious things; the **code is the source of truth**, and `READM
 - **`%LOCALAPPDATA%\onedrive-sync\`** is the state dir / local root (NOT the install dir):
   `config.toml`, `machine-state.json`, `pending.json`, `bisync\<idhash>\` baselines,
   `versions\<idhash>\` archive, `events\YYYY-MM-DD.jsonl`, `logs\`, `.lock` (run lock),
-  `rclone.exe`. The **installed binaries** live separately in `%LOCALAPPDATA%\ods\`.
+  and optionally `rclone.exe` (a local override only — the installer does NOT drop one;
+  `rclone` normally comes off PATH). The **installed binaries** live separately in
+  `%LOCALAPPDATA%\ods\`.
 - Shared, in OneDrive: `Tools\onedrive-sync\mappings.json` (catalog + tombstones; merged
   across machines via conflict copies — a per-machine lock can't protect it).
 - `engine::id_hash` (md-5) names the `bisync\`/`versions\` subdirs — keep it stable or
