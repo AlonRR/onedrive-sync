@@ -115,8 +115,18 @@ $dir = Join-Path $env:LOCALAPPDATA 'ods'
 New-Item -ItemType Directory -Force $dir | Out-Null
 
 # Stop a running tray FIRST -- it holds a lock on ods-gui.exe at the destination, so a
-# re-install/redeploy can't overwrite it otherwise. Then copy the fresh binaries.
-Get-Process ods-gui -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+# re-install/redeploy can't overwrite it otherwise. Stop-Process only SIGNALS termination
+# and returns before Windows releases the exe's image lock, so WAIT for the process to
+# actually exit before copying -- otherwise the copy races and fails "used by another
+# process" (exactly what `ods update` / a redeploy hits, since the tray is running then).
+$gui = Get-Process ods-gui -ErrorAction SilentlyContinue
+if ($gui) {
+    $gui | Stop-Process -Force -ErrorAction SilentlyContinue
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Get-Process ods-gui -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 150
+    }
+}
 Copy-Item (Join-Path $src 'ods.exe')     $dir -Force
 Copy-Item (Join-Path $src 'ods-gui.exe') $dir -Force
 $odsExe = Join-Path $dir 'ods.exe'

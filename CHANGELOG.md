@@ -5,6 +5,15 @@ management GUI, and tray. This repo continues an earlier PowerShell tool's git
 history; that pre-rewrite history is summarized at the bottom, under the
 `v1.0-powershell` tag.
 
+## [0.3.2] — 2026-07-24
+
+### Fixed
+- **`install.ps1` no longer races the tray on redeploy.** It stopped `ods-gui.exe` and
+  copied immediately, but `Stop-Process` returns before Windows releases the exe's image
+  lock, so the copy could fail "used by another process" — precisely the path `ods update`
+  and any redeploy take, since the tray is running then. It now waits for the process to
+  fully exit before copying.
+
 ## [0.3.1] — 2026-07-24
 
 ### Fixed
@@ -132,6 +141,7 @@ selective, multi-machine sync built on `rclone bisync`.
   supported (detected + warned). Symlinks not synced.
 
 <!-- Full changelog: version headings link to their GitHub compare/release view. -->
+[0.3.2]: https://github.com/AlonRR/onedrive-sync/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/AlonRR/onedrive-sync/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/AlonRR/onedrive-sync/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/AlonRR/onedrive-sync/compare/v0.1.0...v0.2.0
