@@ -130,6 +130,7 @@ fn uninstall() -> Result<(), String> {
 
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
     let local = std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA is not set".to_string())?;
     let dir = std::path::Path::new(&local).join("ods");
@@ -198,18 +199,40 @@ fn uninstall() -> Result<(), String> {
     }
 
     // This exe's own file lives inside `dir`, so it can't remove the directory while
-    // running (the file is locked). Hand off to a short-lived detached helper that
-    // waits for this process to exit, then deletes the whole directory. `ping`, not
-    // `timeout`, for the delay — `timeout.exe` refuses to run with redirected stdin,
+    // running (the file is locked), and the tray's ods-gui.exe can keep an image lock
+    // for a moment after taskkill — the common case, since Settings launches uninstall
+    // while the tray is up. A one-shot `rmdir /s` aborts on the first still-locked file
+    // and strands the WHOLE dir, so hand off to a detached helper that RETRIES until
+    // both locks clear (or it times out ~20s), deleting past per-file errors each pass.
+    // PowerShell (not `timeout.exe`) for the pacing: timeout refuses a redirected stdin,
     // which is exactly how Windows launches an UninstallString.
-    let script = format!("ping -n 3 127.0.0.1 >nul & rmdir /s /q \"{}\"", dir.display());
-    let _ = Command::new("cmd")
-        .args(["/C", &script])
+    // ods.exe locks its own file, and the tray's ods-gui.exe can hold an image lock for a
+    // moment after taskkill — a one-shot `rmdir` aborts on the first still-locked file and
+    // strands the WHOLE dir, so retry until both clear. Two footguns this navigates:
+    //   1. Use cmd, NOT powershell: powershell.exe launched with DETACHED_PROCESS has no
+    //      console and exits immediately WITHOUT running its command; cmd runs fine.
+    //   2. Pass the command line RAW: Command::args() applies Rust/MSVCRT quoting, which
+    //      escapes the embedded "path" quotes as \" — cmd.exe misparses that (it wants "")
+    //      and rmdir gets a broken path, failing every retry. raw_arg keeps the path
+    //      "..."-quoted the way cmd expects (so a profile path with spaces still works).
+    // `ping` (not `timeout.exe`, which refuses the redirected stdin an UninstallString is
+    // launched with) paces ~1s per try; ~40 tries ≈ 40s cap. Break away from any job the
+    // launcher placed us in so the helper outlives us; fall back to plain detached if the
+    // job forbids breakaway.
+    let script = format!(
+        "/C ping -n 2 127.0.0.1 >nul & for /l %i in (1,1,40) do @(rmdir /s /q \"{d}\" 2>nul & if not exist \"{d}\" exit & ping -n 2 127.0.0.1 >nul)",
+        d = dir.display()
+    );
+    let detached = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    let mut helper = Command::new("cmd");
+    helper
+        .raw_arg(&script)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-        .spawn();
+        .stderr(Stdio::null());
+    if helper.creation_flags(detached | CREATE_BREAKAWAY_FROM_JOB).spawn().is_err() {
+        let _ = helper.creation_flags(detached).spawn();
+    }
 
     println!("ods uninstalled.");
     Ok(())
@@ -224,17 +247,24 @@ fn update() -> Result<(), String> {
     use std::process::Command;
 
     const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
     // The same one-liner the README documents. The short sleep lets THIS process exit
     // before install.ps1 tries to copy over ods.exe. `-NoExit` keeps the new window up
     // so the result (or any error) stays visible.
     let ps = "Start-Sleep -Seconds 2; \
               irm https://raw.githubusercontent.com/AlonRR/onedrive-sync/main/scripts/get.ps1 | iex";
-    Command::new("powershell")
-        .args(["-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
-        .creation_flags(CREATE_NEW_CONSOLE)
-        .spawn()
-        .map_err(|e| format!("failed to launch the updater: {e}"))?;
+    // Break away from any kill-on-close job the caller is in, so the updater survives
+    // this process exiting (which it must, to free ods.exe for replacement); fall back
+    // to a plain new console if the job forbids breakaway.
+    let mut updater = Command::new("powershell");
+    updater.args(["-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps]);
+    if updater.creation_flags(CREATE_NEW_CONSOLE | CREATE_BREAKAWAY_FROM_JOB).spawn().is_err() {
+        updater
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()
+            .map_err(|e| format!("failed to launch the updater: {e}"))?;
+    }
 
     println!("Update started in a new window (downloads the latest release and re-installs).");
     println!("This process is exiting so its own exe can be replaced.");

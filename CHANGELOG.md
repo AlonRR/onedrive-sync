@@ -23,6 +23,12 @@ history; that pre-rewrite history is summarized at the bottom, under the
   latest release and swap the binaries in place (a running exe can't overwrite itself).
 
 ### Fixed
+- **`ods uninstall` now fully removes `%LOCALAPPDATA%\ods`.** The self-delete helper
+  (which must outlive the exiting `ods.exe` to delete its own directory) never actually
+  worked: its command line was mangled by argument quoting, so `rmdir` got a broken path
+  and left the whole dir — its ~10 MB of binaries — behind after a "successful" uninstall.
+  It now spawns a detached `cmd` retry loop with a raw command line (retries past a
+  lingering `ods-gui.exe` tray lock, ~40 s cap, and breaks away from the launcher's job).
 - Corrected the stale "installer bundles rclone here" comments in `paths.rs` /
   `engine.rs` / `CLAUDE.md`: the local `rclone.exe` is an optional override only; the
   normal path is `rclone` on PATH.
