@@ -5,6 +5,15 @@ management GUI, and tray. This repo continues an earlier PowerShell tool's git
 history; that pre-rewrite history is summarized at the bottom, under the
 `v1.0-powershell` tag.
 
+## [0.3.1] — 2026-07-24
+
+### Fixed
+- **`install.ps1 -FromRelease` / `get.ps1` checksum verification.** The SHA256 sidecar
+  fetched via `Invoke-WebRequest -UseBasicParsing` arrives as a **byte array** (GitHub
+  serves it as octet-stream), so the hash comparison ran on bytes and aborted every
+  download with a false "checksum mismatch." Decode the sidecar to text before comparing.
+  The v0.3.0 binaries were correct — only this client-side check was broken.
+
 ## [0.3.0] — 2026-07-24
 
 ### Added
@@ -123,6 +132,7 @@ selective, multi-machine sync built on `rclone bisync`.
   supported (detected + warned). Symlinks not synced.
 
 <!-- Full changelog: version headings link to their GitHub compare/release view. -->
+[0.3.1]: https://github.com/AlonRR/onedrive-sync/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/AlonRR/onedrive-sync/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/AlonRR/onedrive-sync/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/AlonRR/onedrive-sync/releases/tag/v0.1.0

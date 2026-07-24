@@ -91,14 +91,17 @@ if ($FromRelease -or $Version) {
         # (never run an exe that doesn't match its release hash).
         $want = $null
         try {
-            $want = (Invoke-WebRequest -Uri "$base/$f.sha256" -UseBasicParsing).Content
+            # -UseBasicParsing returns .Content as a BYTE ARRAY for the octet-stream
+            # sidecar (GitHub's content type), so decode to text before parsing the hex.
+            $raw = (Invoke-WebRequest -Uri "$base/$f.sha256" -UseBasicParsing).Content
+            if ($raw -is [byte[]]) { $raw = [System.Text.Encoding]::ASCII.GetString($raw) }
+            $want = ([string]$raw -replace '[^0-9A-Fa-f]', '')
         } catch {
             Write-Warning "no published checksum for $f -- skipping verification."
         }
         if ($want) {
-            $want = ($want -replace '[^0-9A-Fa-f]', '')
             $have = (Get-FileHash $out -Algorithm SHA256).Hash
-            if ($want -and $have -ieq $want) {
+            if ($have -ieq $want) {
                 Write-Host "verified $f (sha256 ok)" -ForegroundColor Green
             } else {
                 throw "checksum mismatch for $f (expected $want, got $have) -- aborting."
