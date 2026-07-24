@@ -258,7 +258,14 @@ fn update() -> Result<(), String> {
     // this process exiting (which it must, to free ods.exe for replacement); fall back
     // to a plain new console if the job forbids breakaway.
     let mut updater = Command::new("powershell");
-    updater.args(["-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps]);
+    updater
+        .args(["-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
+        // `ods update` may be run from a PowerShell 7 (pwsh) terminal, whose PSModulePath
+        // points at pwsh-7 module dirs. The updater is Windows PowerShell 5.1; inheriting
+        // that PSModulePath breaks its module loading (Microsoft.PowerShell.Utility ->
+        // Get-FileHash goes missing and the installer's checksum verify dies). Drop the
+        // var so WinPS 5.1 rebuilds its own default module path.
+        .env_remove("PSModulePath");
     if updater.creation_flags(CREATE_NEW_CONSOLE | CREATE_BREAKAWAY_FROM_JOB).spawn().is_err() {
         updater
             .creation_flags(CREATE_NEW_CONSOLE)

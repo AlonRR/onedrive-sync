@@ -5,6 +5,15 @@ management GUI, and tray. This repo continues an earlier PowerShell tool's git
 history; that pre-rewrite history is summarized at the bottom, under the
 `v1.0-powershell` tag.
 
+## [0.3.3] — 2026-07-24
+
+### Fixed
+- **`ods update` from a PowerShell 7 terminal.** The updater it spawns is Windows
+  PowerShell 5.1, which inherited pwsh 7's `PSModulePath` and then couldn't load
+  `Microsoft.PowerShell.Utility` — so `Get-FileHash` went missing and the installer's
+  checksum verify aborted the update. `ods update` now drops `PSModulePath` for the
+  spawned process, so WinPS 5.1 rebuilds its own default module path.
+
 ## [0.3.2] — 2026-07-24
 
 ### Fixed
@@ -141,6 +150,7 @@ selective, multi-machine sync built on `rclone bisync`.
   supported (detected + warned). Symlinks not synced.
 
 <!-- Full changelog: version headings link to their GitHub compare/release view. -->
+[0.3.3]: https://github.com/AlonRR/onedrive-sync/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/AlonRR/onedrive-sync/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/AlonRR/onedrive-sync/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/AlonRR/onedrive-sync/compare/v0.2.0...v0.3.0
