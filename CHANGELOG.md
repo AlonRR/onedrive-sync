@@ -12,9 +12,10 @@ history; that pre-rewrite history is summarized at the bottom, under the
   PATH (registry-safe `REG_EXPAND_SZ`, idempotent, with a `WM_SETTINGCHANGE`
   broadcast), so the documented CLI actually works from any terminal instead of only
   via the full path. `ods uninstall` removes the entry again.
-- **Dependency preflight.** `install.ps1` checks for `rclone` + `git` and installs a
-  missing one via `winget` (`-SkipDeps` opts out), restoring the auto-install the
-  PowerShell tool had. No more first-sync failing silently because rclone isn't there.
+- **Dependency preflight.** `install.ps1` checks for `rclone` + `git` and offers to
+  install a missing one via `winget` — prompting first, `-YesDeps` to auto-approve
+  (non-interactive), `-SkipDeps` to skip the check entirely. No more first-sync
+  failing silently because rclone isn't there.
 - **Checksum-verified downloads.** `install.ps1 -FromRelease` verifies each binary
   against its published `.sha256` before running it (a mismatch aborts; an absent
   sidecar, as on older releases, warns and skips).

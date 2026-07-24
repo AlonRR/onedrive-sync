@@ -9,16 +9,20 @@
   re-run this script from an ELEVATED shell to finish the swap.
 
   Adds %LOCALAPPDATA%\ods to the per-user PATH so `ods <cmd>` works from any
-  terminal, and preflights the rclone + git runtime deps (winget auto-install
-  unless -SkipDeps). Downloaded release binaries are checksum-verified.
+  terminal, and preflights the rclone + git runtime deps (winget install after a
+  prompt; -YesDeps auto-approves for non-interactive runs, -SkipDeps skips the
+  check). Downloaded release binaries are checksum-verified.
 #>
 param(
     # Install prebuilt binaries from a GitHub Release instead of building from source.
     [switch]$FromRelease,
     # A specific release tag (e.g. v0.1.0); implies -FromRelease. Default: the latest release.
     [string]$Version,
-    # Skip the rclone/git preflight (don't check for or auto-install the runtime deps).
-    [switch]$SkipDeps
+    # Skip the rclone/git preflight (don't check for or install the runtime deps).
+    [switch]$SkipDeps,
+    # Auto-approve installing a missing rclone/git via winget without prompting
+    # (for non-interactive / scripted installs). Default is to prompt first.
+    [switch]$YesDeps
 )
 $ErrorActionPreference = 'Stop'
 
@@ -36,6 +40,22 @@ function Install-OdsDep($exe, $wingetId, $label) {
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
         Write-Host "  winget not found -- install $label manually (rclone.org/downloads or git-scm.com)." -ForegroundColor Yellow
         return
+    }
+    # Gate the install behind a confirmation, unless -YesDeps auto-approves it. A
+    # non-interactive session with no -YesDeps can't answer the prompt, so it skips
+    # (and says how to opt in) rather than hanging or erroring on Read-Host.
+    if (-not $YesDeps) {
+        if (-not [Environment]::UserInteractive) {
+            Write-Host "  non-interactive -- re-run with -YesDeps to auto-install $label, or install it manually." -ForegroundColor Yellow
+            return
+        }
+        $ans = ''
+        try { $ans = Read-Host "Install $label now via winget ($wingetId)? [Y/n]" }
+        catch { Write-Host "  can't prompt here -- re-run with -YesDeps to auto-install $label." -ForegroundColor Yellow; return }
+        if ($ans.Trim() -match '^(n|no)$') {
+            Write-Host "  skipped $label -- install it manually, or re-run with -YesDeps." -ForegroundColor Yellow
+            return
+        }
     }
     Write-Host "installing $label via winget ($wingetId)..." -ForegroundColor Cyan
     try {

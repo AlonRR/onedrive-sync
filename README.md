@@ -31,7 +31,8 @@ installing), the tray starts, the `ods-sync` (logon + every 30 min) and `ods-tra
 apps entry are created (both per-user, no elevation).
 
 `rclone` + `git` are required at runtime; the installer preflights them and, if either is
-missing, installs it via `winget` (pass `-SkipDeps` to skip that). Downloaded release
+missing, offers to install it via `winget` — prompting first, or auto-approving with
+`-YesDeps` for non-interactive installs (`-SkipDeps` skips the check). Downloaded release
 binaries are verified against their published SHA256 before anything runs.
 
 Already installed? `ods update` pulls the latest release and re-installs in place.
